@@ -57,6 +57,21 @@ unless ( $service->can('table') ) {
     exit 0;
 }
 
+my %role_permissions = (
+    admin => {
+        can_set_role => 1,
+        can_manage_users => 1,
+        can_read => 1,
+    },
+    manager => {
+        can_manage_users => 1,
+        can_read => 1,
+    },
+    auditor => {
+        can_read => 1,
+    },
+);
+
 if ( $ENV{REQUEST_METHOD} =~ /POST|PUT|DELETE/ ) {
     my $session = get_service('sessions')->validate(session_id => $in{session_id});
     unless ($session) {
@@ -64,7 +79,19 @@ if ( $ENV{REQUEST_METHOD} =~ /POST|PUT|DELETE/ ) {
         print_json( { error => html_escape('Session expired, please login again') } );
         exit 0;
     }
-    unless ($session->validate_role('admin')) {
+    my $role = get_service('user', _id => $session->user_id)->role;
+    my $perm = $role_permissions{$role} || {};
+    if ($in{method} && $in{method} eq 'set_role' && !$perm->{can_set_role}) {
+        print_header( status => 403 );
+        print_json( { error => html_escape('Insufficient privileges for role assignment') } );
+        exit 0;
+    }
+    if ($service_name eq 'User' && !$perm->{can_manage_users}) {
+        print_header( status => 403 );
+        print_json( { error => html_escape('Insufficient privileges for user management') } );
+        exit 0;
+    }
+    unless ($perm->{can_read}) {
         print_header( status => 403 );
         print_json( { error => html_escape('Insufficient privileges') } );
         exit 0;
@@ -76,7 +103,12 @@ if ( $ENV{REQUEST_METHOD} =~ /POST|PUT|DELETE/ ) {
     }
 }
 
-if ( $in{method} ) {
+if ( $in{method} && $in{method} eq 'set_role' && $service_name eq 'User' ) {
+    $res = $service->api_set_role( %in, admin => $admin );
+    if ( !ref $res ) {
+        $res = [ $res ];
+    }
+} elsif ( $in{method} ) {
     my $method = "api_$in{method}";
     if ( $service->can( $method ) ) {
         $res = $service->$method( %in, admin => $admin );

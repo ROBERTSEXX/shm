@@ -738,5 +738,18 @@ sub has_role {
     return $self->role eq $role;
 }
 
+sub api_set_role {
+    my $self = shift;
+    my %args = @_;
+    my $session = get_service('sessions')->validate(session_id => $args{session_id});
+    unless ($session && $session->validate_role('admin')) {
+        get_service('report')->add_error('Insufficient privileges');
+        return undef;
+    }
+    my $user = $self->id($args{user_id});
+    $user->role($args{role});
+    return { user_id => $user->id, role => $user->role };
+}
+
 1;
 
