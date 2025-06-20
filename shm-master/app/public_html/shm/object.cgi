@@ -58,8 +58,13 @@ unless ( $service->can('table') ) {
 }
 
 if ( $ENV{REQUEST_METHOD} =~ /POST|PUT|DELETE/ ) {
-    my $session = get_service('sessions')->id($in{session_id});
-    unless ($session && $session->validate_csrf_token($in{csrf_token})) {
+    my $session = get_service('sessions')->validate(session_id => $in{session_id});
+    unless ($session) {
+        print_header( status => 401, location => '/shm/user/auth.cgi' );
+        print_json( { error => html_escape('Session expired, please login again') } );
+        exit 0;
+    }
+    unless ($session->validate_csrf_token($in{csrf_token})) {
         print_header( status => 403 );
         print_json( { error => html_escape('Invalid CSRF token') } );
         exit 0;

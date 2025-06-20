@@ -5,6 +5,7 @@ use parent 'Core::Base';
 use Core::Base;
 use Core::Utils qw( now );
 use MIME::Base64 ();
+use constant SESSION_TIMEOUT_MINUTES => 30;
 
 sub table { return 'sessions' };
 
@@ -45,6 +46,8 @@ sub add {
     );
     $args{id} = $self->encrypt_session_id($args{id});
     $args{settings} = $self->encrypt_settings($args{settings} || {});
+    $args{created} = now();
+    $args{updated} = now();
     my $session_id = $self->SUPER::add( %args );
     $self->_delete_expired;
     $self->res->{id} = $session_id;
@@ -63,12 +66,17 @@ sub validate {
     my $session = $self->id( $args{session_id} );
     return undef unless $session;
 
-    # do not update more than 3 minutes
+    my $now = time();
+    my $updated = string_to_utime($session->{updated});
+    if ($now - $updated > SESSION_TIMEOUT_MINUTES * 60) {
+        $self->delete($args{session_id});
+        return undef;
+    }
+
     $self->_set(
         updated => now,
         where => {
             id => $args{session_id},
-            updated => { '<', \[ 'NOW() - INTERVAL ? MINUTE', 3 ] },
         },
     );
 
