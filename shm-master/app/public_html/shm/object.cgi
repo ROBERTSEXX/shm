@@ -108,6 +108,21 @@ if ( $in{method} && $in{method} eq 'set_role' && $service_name eq 'User' ) {
     if ( !ref $res ) {
         $res = [ $res ];
     }
+} elsif ( $in{method} && $in{method} eq 'get_roles' && $service_name eq 'User' ) {
+    $res = [
+        { role => 'admin', permissions => $role_permissions{admin} },
+        { role => 'manager', permissions => $role_permissions{manager} },
+        { role => 'auditor', permissions => $role_permissions{auditor} },
+    ];
+} elsif ( $in{method} && $in{method} eq 'get_menu' && $service_name eq 'User' ) {
+    my $session = get_service('sessions')->validate(session_id => $in{session_id});
+    my $role = $session ? get_service('user', _id => $session->user_id)->role : '';
+    my %menu = (
+        admin => [qw(users roles audit dashboard settings)],
+        manager => [qw(users dashboard)],
+        auditor => [qw(audit dashboard)],
+    );
+    $res = { menu => $menu{$role} || [] };
 } elsif ( $in{method} ) {
     my $method = "api_$in{method}";
     if ( $service->can( $method ) ) {
