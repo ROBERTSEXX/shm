@@ -8,6 +8,7 @@ my $user = SHM->new();
 use Core::System::ServiceManager qw( get_service );
 use Core::Utils qw(
     parse_args
+    html_escape
 );
 
 our %in = parse_args();
@@ -31,7 +32,7 @@ my %args = (
 get_service('Events')->make( %args );
 
 print_header();
-print_json( );
+print_json( html_escape('OK') );
 
 $user->commit;
 

@@ -14,6 +14,7 @@ use Core::Utils qw(
     now
     switch_user
     decode_json
+    html_escape
 );
 
 my %headers;
@@ -32,7 +33,7 @@ $in{object} ||= $ENV{PATH_INFO};
 
 unless ( $in{object} ) {
     print_header( status => 400 );
-    print_json( { error => "Unknown object" } );
+    print_json( { error => html_escape("Unknown object") } );
     exit 0;
 }
 
@@ -46,13 +47,13 @@ my $service_name = $in{object};
 our $service = get_service( $service_name, ( $in{id} ? ( _id => $in{id} ) : () ) );
 unless ( $service ) {
     print_header( status => 400 );
-    print_json( { error => "`$service_name` not exists" } );
+    print_json( { error => html_escape("`$service_name` not exists") } );
     exit 0;
 }
 
 unless ( $service->can('table') ) {
     print_header( status => 400 );
-    print_json( { error => "service not supported API" } );
+    print_json( { error => html_escape("service not supported API") } );
     exit 0;
 }
 
@@ -66,7 +67,7 @@ if ( $in{method} ) {
     }
     else {
         %headers = ( status => 404 );
-        $res = { error => "Method not found" };
+        $res = { error => html_escape("Method not found") };
     }
 } elsif ( $ENV{REQUEST_METHOD} eq 'PUT' ) {
     if ( my $ret = $service->api( 'add', %in, admin => $admin ) ) {
@@ -75,7 +76,7 @@ if ( $in{method} ) {
     }
     else {
         %headers = ( status => 400 );
-        $res = { error => "Can't add new object" };
+        $res = { error => html_escape("Can't add new object") };
     }
 }
 elsif ( $ENV{REQUEST_METHOD} eq 'POST' ) {
@@ -85,7 +86,7 @@ elsif ( $ENV{REQUEST_METHOD} eq 'POST' ) {
         $res = \%ret;
     } else {
         %headers = ( status => 404 );
-        $res = { error => "Object not found" };
+        $res = { error => html_escape("Object not found") };
     }
 }
 elsif ( $ENV{REQUEST_METHOD} eq 'DELETE' ) {
@@ -94,7 +95,7 @@ elsif ( $ENV{REQUEST_METHOD} eq 'DELETE' ) {
         %headers = ( status => 204 );
     } else {
         %headers = ( status => 404 );
-        $res = { error => "Service not found" };
+        $res = { error => html_escape("Service not found") };
     }
 }
 else {
@@ -116,11 +117,11 @@ my $report = get_service('report');
 
 unless ( $report->is_success ) {
     %headers = ( status => 400 );
-    $res = { error => $report->errors };
+    $res = { error => html_escape($report->errors) };
 }
 
 print_header( %headers );
-print_json( $res );
+print_json( html_escape($res) );
 
 $user->commit();
 
@@ -131,7 +132,7 @@ sub get_service_id {
 
     unless ( $service_id ) {
         print_header( status => 400 );
-        print_json( { error => '`id` not present' } );
+        print_json( { error => html_escape('`id` not present') } );
         exit 0;
     }
     return $service_id;

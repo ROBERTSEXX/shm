@@ -8,6 +8,7 @@ my $user = SHM->new();
 use Core::System::ServiceManager qw( get_service );
 use Core::Utils qw(
     parse_args
+    html_escape
 );
 
 our %in = parse_args();
@@ -30,7 +31,7 @@ print_header(
     'x-console-eof' => $console->eof,
 );
 
-print $log;
+print html_escape($log);
 
 exit 0;
 

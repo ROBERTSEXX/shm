@@ -8,6 +8,7 @@ my $user = SHM->new();
 use Core::System::ServiceManager qw( get_service );
 use Core::Utils qw(
     parse_args
+    html_escape
 );
 
 our %in = parse_args();
@@ -27,5 +28,6 @@ my (undef, $res ) = $ssh->exec(
 
 $user->commit;
 
+print html_escape('OK');
 exit 0;
 
