@@ -33,7 +33,8 @@ function fetchUsers() {
 }
 
 function setRole(user_id, role) {
-  const btn = document.querySelector(`tr[data-user='${user_id}'] button`);
+  const tr = document.querySelector(`tr[data-user='${user_id}']`);
+  const btn = tr ? tr.querySelector('button') : null;
   if (btn) btn.disabled = true;
   fetch('/shm/object.cgi?object=User&method=set_role', {
     method: 'POST',
@@ -42,11 +43,15 @@ function setRole(user_id, role) {
   })
     .then(r => r.json())
     .then(resp => {
-      if (resp.error) alert('Ошибка: ' + resp.error);
-      else alert('Роль успешно назначена');
-      location.reload();
+      if (resp.error) {
+        alert('Ошибка: ' + resp.error);
+        if (tr) tr.style.background = '#ffe0e0';
+      } else {
+        alert('Роль успешно назначена');
+        location.reload();
+      }
     })
-    .catch(e => { alert('Ошибка сети'); })
+    .catch(e => { alert('Ошибка сети'); if (tr) tr.style.background = '#ffe0e0'; })
     .finally(() => { if (btn) btn.disabled = false; });
 }
 

@@ -106,7 +106,16 @@ if ( $in{method} && $in{method} eq 'set_role' && $service_name eq 'User' ) {
     my $target_user = get_service('user', _id => $in{user_id});
     my $old_role = $target_user->role;
     my $result = $service->api_set_role( %in, admin => $admin );
-    Core::System::Logger::log('role_assign', { user_id => $session->user_id, target => $in{user_id}, old_role => $old_role, new_role => $in{role} });
+    my $new_role = $in{role};
+    Core::System::Logger::log('role_assign', {
+        user_id => $session->user_id,
+        target => $in{user_id},
+        old_role => $old_role,
+        new_role => $new_role,
+        before => { %{$target_user->get} },
+        after => { %{$service->id($in{user_id})->get} },
+        ts => scalar localtime,
+    });
     $res = $result;
     if (!$result) {
         print_header( status => 400 );
