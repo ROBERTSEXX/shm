@@ -62,13 +62,19 @@ my %role_permissions = (
         can_set_role => 1,
         can_manage_users => 1,
         can_read => 1,
+        can_audit => 1,
+        can_dashboard => 1,
+        can_settings => 1,
     },
     manager => {
         can_manage_users => 1,
         can_read => 1,
+        can_dashboard => 1,
     },
     auditor => {
         can_read => 1,
+        can_audit => 1,
+        can_dashboard => 1,
     },
 );
 

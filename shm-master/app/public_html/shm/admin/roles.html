@@ -43,16 +43,29 @@ function setRole(user_id, role) {
 function render(users) {
   const tbody = document.querySelector('#users tbody');
   tbody.innerHTML = '';
+  const myRole = localStorage.getItem('my_role');
   users.forEach(u => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${u.user_id}</td><td>${u.login}</td><td>${u.role||''}</td>` +
-      `<td><select>${roles.map(r=>`<option${u.role===r?' selected':''}>${r}</option>`)}</select> <button>Назначить</button></td>`;
-    tr.querySelector('button').onclick = () => setRole(u.user_id, tr.querySelector('select').value);
+    tr.innerHTML = `<td>${u.user_id}</td><td>${u.login}</td><td>${u.role||''}</td>`;
+    if (myRole === 'admin' || myRole === 'manager') {
+      tr.innerHTML += `<td><select>${roles.map(r=>`<option${u.role===r?' selected':''}>${r}</option>`)}</select> <button>Назначить</button></td>`;
+      tr.querySelector('button').onclick = () => setRole(u.user_id, tr.querySelector('select').value);
+    } else {
+      tr.innerHTML += '<td>-</td>';
+    }
     tbody.appendChild(tr);
   });
 }
 
-fetchRoles().then(() => fetchUsers()).then(render);
+fetchRoles().then(() => fetchUsers()).then(users => {
+  // Получаем свою роль через API
+  fetch('/shm/object.cgi?object=User&session_id=' + session_id)
+    .then(r => r.json()).then(data => {
+      const me = data.data.find(u => u.user_id == localStorage.getItem('my_user_id'));
+      localStorage.setItem('my_role', me ? me.role : '');
+      render(users);
+    });
+});
 </script>
 </body>
 </html>
