@@ -89,25 +89,16 @@ if ( $ENV{REQUEST_METHOD} =~ /POST|PUT|DELETE/ ) {
     my $role = get_service('user', _id => $session->user_id)->role;
     my $perm = $role_permissions{$role} || {};
     if ($in{method} && $in{method} eq 'set_role' && !$perm->{can_set_role}) {
-        Core::System::Logger::log('role_assign_denied', { user_id => $session->user_id, target => $in{user_id}, role => $role });
-        print_header( status => 403 );
-        print_json( { error => html_escape('Insufficient privileges for role assignment') } );
-        exit 0;
+        rbac_error('role_assign_denied', 'Insufficient privileges for role assignment', { user_id => $session->user_id, target => $in{user_id}, role => $role });
     }
     if ($service_name eq 'User' && !$perm->{can_manage_users}) {
-        print_header( status => 403 );
-        print_json( { error => html_escape('Insufficient privileges for user management') } );
-        exit 0;
+        rbac_error('user_manage_denied', 'Insufficient privileges for user management', { user_id => $session->user_id, role => $role });
     }
     unless ($perm->{can_read}) {
-        print_header( status => 403 );
-        print_json( { error => html_escape('Insufficient privileges') } );
-        exit 0;
+        rbac_error('insufficient_privileges', 'Insufficient privileges', { user_id => $session->user_id });
     }
     unless ($session->validate_csrf_token($in{csrf_token})) {
-        print_header( status => 403 );
-        print_json( { error => html_escape('Invalid CSRF token') } );
-        exit 0;
+        rbac_error('invalid_csrf_token', 'Invalid CSRF token', { user_id => $session->user_id });
     }
 }
 
@@ -136,7 +127,15 @@ if ( $in{method} && $in{method} eq 'set_role' && $service_name eq 'User' ) {
         manager => [qw(users dashboard)],
         auditor => [qw(audit dashboard)],
     );
-    $res = { menu => $menu{$role} || [] };
+    my $allowed = $role_permissions{$role} || {};
+    my @filtered = grep {
+        ($_ eq 'users'     && $allowed->{can_manage_users}) ||
+        ($_ eq 'roles'     && $allowed->{can_set_role}) ||
+        ($_ eq 'audit'     && $allowed->{can_audit}) ||
+        ($_ eq 'dashboard' && $allowed->{can_dashboard}) ||
+        ($_ eq 'settings'  && $allowed->{can_settings})
+    } @{ $menu{$role} || [] };
+    $res = { menu => \@filtered };
 } elsif ( $in{method} ) {
     my $method = "api_$in{method}";
     if ( $service->can( $method ) ) {
@@ -216,4 +215,12 @@ sub get_service_id {
         exit 0;
     }
     return $service_id;
+}
+
+sub rbac_error {
+    my ($type, $msg, $context) = @_;
+    Core::System::Logger::log($type, $context);
+    print_header( status => 403 );
+    print_json( { error => html_escape($msg) } );
+    exit 0;
 }
