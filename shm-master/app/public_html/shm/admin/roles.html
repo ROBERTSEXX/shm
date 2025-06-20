@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Назначение ролей</title>
+<style>
+body { font-family: sans-serif; background: #f8f8f8; }
+table { border-collapse: collapse; width: 100%; background: #fff; }
+th, td { border: 1px solid #ccc; padding: 8px; }
+th { background: #eee; }
+select, button { padding: 4px 8px; }
+</style>
+</head>
+<body>
+<h2>Пользователи и роли</h2>
+<table id="users">
+<thead><tr><th>ID</th><th>Логин</th><th>Роль</th><th>Назначить роль</th></tr></thead>
+<tbody></tbody>
+</table>
+<script>
+const session_id = localStorage.getItem('session_id');
+const csrf_token = localStorage.getItem('csrf_token');
+let roles = [];
+
+function fetchRoles() {
+  return fetch('/shm/object.cgi?object=User&method=get_roles&session_id=' + session_id)
+    .then(r => r.json()).then(data => { roles = data.map(r => r.role); });
+}
+
+function fetchUsers() {
+  return fetch('/shm/object.cgi?object=User&session_id=' + session_id)
+    .then(r => r.json()).then(data => data.data || []);
+}
+
+function setRole(user_id, role) {
+  fetch('/shm/object.cgi?object=User&method=set_role', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id, csrf_token, user_id, role })
+  }).then(() => location.reload());
+}
+
+function render(users) {
+  const tbody = document.querySelector('#users tbody');
+  tbody.innerHTML = '';
+  users.forEach(u => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${u.user_id}</td><td>${u.login}</td><td>${u.role||''}</td>` +
+      `<td><select>${roles.map(r=>`<option${u.role===r?' selected':''}>${r}</option>`)}</select> <button>Назначить</button></td>`;
+    tr.querySelector('button').onclick = () => setRole(u.user_id, tr.querySelector('select').value);
+    tbody.appendChild(tr);
+  });
+}
+
+fetchRoles().then(() => fetchUsers()).then(render);
+</script>
+</body>
+</html>
