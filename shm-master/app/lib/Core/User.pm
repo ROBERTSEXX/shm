@@ -107,6 +107,9 @@ sub structure {
             type => 'json',
             value => {}
         },
+        role => {
+            type => 'text',
+        },
     };
 }
 
@@ -613,7 +616,17 @@ sub withdraws {
 
 sub is_admin {
     my $self = shift;
-    return $self->get_gid;
+    return $self->role eq 'admin';
+}
+
+sub is_auditor {
+    my $self = shift;
+    return $self->role eq 'auditor';
+}
+
+sub is_manager {
+    my $self = shift;
+    return $self->role eq 'manager';
 }
 
 sub list_for_api {
@@ -710,6 +723,20 @@ sub income_percent {
 }
 
 sub telegram { shift->srv('Transport::Telegram') };
+
+sub role {
+    my $self = shift;
+    my $role = shift;
+    if (defined $role) {
+        $self->set(role => $role);
+    }
+    return $self->get('role');
+}
+
+sub has_role {
+    my ($self, $role) = @_;
+    return $self->role eq $role;
+}
 
 1;
 

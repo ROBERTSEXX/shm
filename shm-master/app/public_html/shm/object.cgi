@@ -64,6 +64,11 @@ if ( $ENV{REQUEST_METHOD} =~ /POST|PUT|DELETE/ ) {
         print_json( { error => html_escape('Session expired, please login again') } );
         exit 0;
     }
+    unless ($session->validate_role('admin')) {
+        print_header( status => 403 );
+        print_json( { error => html_escape('Insufficient privileges') } );
+        exit 0;
+    }
     unless ($session->validate_csrf_token($in{csrf_token})) {
         print_header( status => 403 );
         print_json( { error => html_escape('Invalid CSRF token') } );

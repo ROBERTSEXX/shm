@@ -199,4 +199,12 @@ sub id {
     return $self;
 }
 
+sub validate_role {
+    my ($self, $role) = @_;
+    my $user_id = $self->user_id;
+    return 0 unless $user_id;
+    my $user = get_service('user', _id => $user_id);
+    return $user->has_role($role);
+}
+
 1;
