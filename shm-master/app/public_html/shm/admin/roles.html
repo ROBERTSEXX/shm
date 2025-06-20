@@ -33,11 +33,21 @@ function fetchUsers() {
 }
 
 function setRole(user_id, role) {
+  const btn = document.querySelector(`tr[data-user='${user_id}'] button`);
+  if (btn) btn.disabled = true;
   fetch('/shm/object.cgi?object=User&method=set_role', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session_id, csrf_token, user_id, role })
-  }).then(() => location.reload());
+  })
+    .then(r => r.json())
+    .then(resp => {
+      if (resp.error) alert('Ошибка: ' + resp.error);
+      else alert('Роль успешно назначена');
+      location.reload();
+    })
+    .catch(e => { alert('Ошибка сети'); })
+    .finally(() => { if (btn) btn.disabled = false; });
 }
 
 function render(users) {
@@ -46,6 +56,7 @@ function render(users) {
   const myRole = localStorage.getItem('my_role');
   users.forEach(u => {
     const tr = document.createElement('tr');
+    tr.setAttribute('data-user', u.user_id);
     tr.innerHTML = `<td>${u.user_id}</td><td>${u.login}</td><td>${u.role||''}</td>`;
     if (myRole === 'admin' || myRole === 'manager') {
       tr.innerHTML += `<td><select>${roles.map(r=>`<option${u.role===r?' selected':''}>${r}</option>`)}</select> <button>Назначить</button></td>`;

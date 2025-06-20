@@ -16,6 +16,7 @@ use Core::Utils qw(
     decode_json
     html_escape
 );
+use Core::System::Logger;
 
 my %headers;
 our %in = parse_args();
@@ -88,6 +89,7 @@ if ( $ENV{REQUEST_METHOD} =~ /POST|PUT|DELETE/ ) {
     my $role = get_service('user', _id => $session->user_id)->role;
     my $perm = $role_permissions{$role} || {};
     if ($in{method} && $in{method} eq 'set_role' && !$perm->{can_set_role}) {
+        Core::System::Logger::log('role_assign_denied', { user_id => $session->user_id, target => $in{user_id}, role => $role });
         print_header( status => 403 );
         print_json( { error => html_escape('Insufficient privileges for role assignment') } );
         exit 0;
@@ -110,9 +112,15 @@ if ( $ENV{REQUEST_METHOD} =~ /POST|PUT|DELETE/ ) {
 }
 
 if ( $in{method} && $in{method} eq 'set_role' && $service_name eq 'User' ) {
-    $res = $service->api_set_role( %in, admin => $admin );
-    if ( !ref $res ) {
-        $res = [ $res ];
+    my $target_user = get_service('user', _id => $in{user_id});
+    my $old_role = $target_user->role;
+    my $result = $service->api_set_role( %in, admin => $admin );
+    Core::System::Logger::log('role_assign', { user_id => $session->user_id, target => $in{user_id}, old_role => $old_role, new_role => $in{role} });
+    $res = $result;
+    if (!$result) {
+        print_header( status => 400 );
+        print_json( { error => html_escape('Role assignment failed') } );
+        exit 0;
     }
 } elsif ( $in{method} && $in{method} eq 'get_roles' && $service_name eq 'User' ) {
     $res = [
