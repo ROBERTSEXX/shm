@@ -4,6 +4,7 @@ use v5.14;
 use parent 'Core::Base';
 use Core::Base;
 use Core::Utils qw( now );
+use MIME::Base64 ();
 
 sub table { return 'sessions' };
 
@@ -42,12 +43,13 @@ sub add {
         user_id => $self->SUPER::user_id,
         @_,
     );
-
+    $args{id} = $self->encrypt_session_id($args{id});
+    $args{settings} = $self->encrypt_settings($args{settings} || {});
     my $session_id = $self->SUPER::add( %args );
-
     $self->_delete_expired;
     $self->res->{id} = $session_id;
-
+    # Генерация CSRF-токена при создании сессии
+    $self->generate_csrf_token;
     return $session_id;
 }
 
@@ -120,6 +122,73 @@ sub user_id {
     my $self = shift;
 
     return $self->res->{user_id};
+}
+
+sub generate_csrf_token {
+    my $self = shift;
+    my $token = join '', map { ( 'a'..'z', 'A'..'Z', 0..9 )[rand 62] } 1..32;
+    $self->set_csrf_token($token);
+    return $token;
+}
+
+sub set_csrf_token {
+    my ($self, $token) = @_;
+    my $settings = $self->res->{settings} || {};
+    $settings->{csrf_token} = $token;
+    $self->set(settings => $settings);
+}
+
+sub get_csrf_token {
+    my $self = shift;
+    my $settings = $self->res->{settings} || {};
+    return $settings->{csrf_token};
+}
+
+sub validate_csrf_token {
+    my ($self, $token) = @_;
+    return $token && $token eq $self->get_csrf_token;
+}
+
+sub encrypt_session_id {
+    my ($self, $id) = @_;
+    my $key = 'shm_secret_key';
+    my $enc = join '', map { chr(ord($_) ^ ord(substr($key, $_ % length($key), 1))) } split //, $id;
+    return MIME::Base64::encode_base64url($enc);
+}
+
+sub decrypt_session_id {
+    my ($self, $enc) = @_;
+    my $key = 'shm_secret_key';
+    my $id = MIME::Base64::decode_base64url($enc);
+    return join '', map { chr(ord($_) ^ ord(substr($key, $_ % length($key), 1))) } split //, $id;
+}
+
+sub encrypt_settings {
+    my ($self, $settings) = @_;
+    my $json = encode_json($settings);
+    my $key = 'shm_secret_key';
+    my $enc = join '', map { chr(ord($_) ^ ord(substr($key, $_ % length($key), 1))) } split //, $json;
+    return MIME::Base64::encode_base64url($enc);
+}
+
+sub decrypt_settings {
+    my ($self, $enc) = @_;
+    my $key = 'shm_secret_key';
+    my $json = MIME::Base64::decode_base64url($enc);
+    $json = join '', map { chr(ord($_) ^ ord(substr($key, $_ % length($key), 1))) } split //, $json;
+    return decode_json($json);
+}
+
+sub id {
+    my $self = shift;
+    my $enc_id = shift;
+    my $id = $self->decrypt_session_id($enc_id);
+    my $session = $self->SUPER::id($id);
+    if ($session && $session->{settings}) {
+        $session->{settings} = $self->decrypt_settings($session->{settings});
+    }
+    $self->res($session) if $session;
+    return $self;
 }
 
 1;

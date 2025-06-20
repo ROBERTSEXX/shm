@@ -57,6 +57,15 @@ unless ( $service->can('table') ) {
     exit 0;
 }
 
+if ( $ENV{REQUEST_METHOD} =~ /POST|PUT|DELETE/ ) {
+    my $session = get_service('sessions')->id($in{session_id});
+    unless ($session && $session->validate_csrf_token($in{csrf_token})) {
+        print_header( status => 403 );
+        print_json( { error => html_escape('Invalid CSRF token') } );
+        exit 0;
+    }
+}
+
 if ( $in{method} ) {
     my $method = "api_$in{method}";
     if ( $service->can( $method ) ) {
