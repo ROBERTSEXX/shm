@@ -1,0 +1,24 @@
+apiVersion: v1
+entries:
+  shm:
+  - apiVersion: v2
+    created: "2024-01-27T23:14:59.309059+03:00"
+    dependencies:
+    - name: helm-common
+      repository: file://charts/helm-common
+      version: 0.2.12
+    - name: mysql
+      repository: https://charts.bitnami.com/bitnami
+      version: 9.7.2
+    description: A Helm chart for Kubernetes
+    digest: 4e0172910bcab01d5aebf178859c018777bc396b24a0cf89ca1ebcf80c9b7fed
+    home: https://github.com/danuk/shm
+    maintainers:
+    - email: danek1982@gmail.com
+      name: danuk
+    name: shm
+    type: application
+    urls:
+    - https://danuk.github.io/shm/shm-0.0.1.tgz
+    version: 0.0.1
+generated: "2024-01-27T23:14:59.30598+03:00"
