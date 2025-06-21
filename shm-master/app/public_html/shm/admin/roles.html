@@ -9,10 +9,14 @@ table { border-collapse: collapse; width: 100%; background: #fff; }
 th, td { border: 1px solid #ccc; padding: 8px; }
 th { background: #eee; }
 select, button { padding: 4px 8px; }
+.status { font-size: 14px; margin: 10px 0; }
+tr.error { background: #ffe0e0; }
+tr.success { background: #e0ffe0; }
 </style>
 </head>
 <body>
 <h2>Пользователи и роли</h2>
+<div class="status" id="status"></div>
 <table id="users">
 <thead><tr><th>ID</th><th>Логин</th><th>Роль</th><th>Назначить роль</th></tr></thead>
 <tbody></tbody>
@@ -21,6 +25,12 @@ select, button { padding: 4px 8px; }
 const session_id = localStorage.getItem('session_id');
 const csrf_token = localStorage.getItem('csrf_token');
 let roles = [];
+
+function setStatus(msg, type) {
+  const s = document.getElementById('status');
+  s.textContent = msg;
+  s.style.color = type === 'error' ? '#b00' : (type === 'success' ? '#080' : '#222');
+}
 
 function fetchRoles() {
   return fetch('/shm/object.cgi?object=User&method=get_roles&session_id=' + session_id)
@@ -35,7 +45,9 @@ function fetchUsers() {
 function setRole(user_id, role) {
   const tr = document.querySelector(`tr[data-user='${user_id}']`);
   const btn = tr ? tr.querySelector('button') : null;
+  setStatus('Назначение роли...', '');
   if (btn) btn.disabled = true;
+  tr.classList.remove('error','success');
   fetch('/shm/object.cgi?object=User&method=set_role', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -44,14 +56,15 @@ function setRole(user_id, role) {
     .then(r => r.json())
     .then(resp => {
       if (resp.error) {
-        alert('Ошибка: ' + resp.error);
-        if (tr) tr.style.background = '#ffe0e0';
+        setStatus('Ошибка: ' + resp.error, 'error');
+        tr.classList.add('error');
       } else {
-        alert('Роль успешно назначена');
-        location.reload();
+        setStatus('Роль успешно назначена', 'success');
+        tr.classList.add('success');
+        setTimeout(()=>location.reload(), 1000);
       }
     })
-    .catch(e => { alert('Ошибка сети'); if (tr) tr.style.background = '#ffe0e0'; })
+    .catch(e => { setStatus('Ошибка сети', 'error'); if (tr) tr.classList.add('error'); })
     .finally(() => { if (btn) btn.disabled = false; });
 }
 
@@ -74,7 +87,6 @@ function render(users) {
 }
 
 fetchRoles().then(() => fetchUsers()).then(users => {
-  // Получаем свою роль через API
   fetch('/shm/object.cgi?object=User&session_id=' + session_id)
     .then(r => r.json()).then(data => {
       const me = data.data.find(u => u.user_id == localStorage.getItem('my_user_id'));
