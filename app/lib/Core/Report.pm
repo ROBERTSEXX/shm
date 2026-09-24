@@ -6,8 +6,9 @@ use parent 'Core::Base';
 use Core::Base;
 
 *error = \&add_error;
-*fatal = \&add_error;
 *warning = \&add_error;
+
+sub _id {}; # всегда один экземляр для всех
 
 sub add_error {
     my $self = shift;
@@ -21,6 +22,34 @@ sub add_error {
     logger->warning( $msg );
     push @{ $self->{errors}||=[] }, $msg;
     return $msg;
+}
+
+sub status {
+    my $self = shift;
+    my $status = shift;
+
+    if ( $status ) {
+        $self->{status} = $status;
+    }
+
+    return $self->{status};
+}
+
+sub headers {
+    my $self = shift;
+    my $headers = shift;
+
+    $self->{headers} ||= {};
+
+    if ( ref $headers eq 'HASH' ) {
+        $self->{headers} = $headers;
+    }
+
+    if ( my $status = $self->status ) {
+        $self->{headers}->{status} = $status;
+    }
+
+    return wantarray ? %{ $self->{headers} } : $self->{headers};
 }
 
 sub errors {

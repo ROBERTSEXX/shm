@@ -3,9 +3,10 @@ package Core::Sessions;
 use v5.14;
 use parent 'Core::Base';
 use Core::Base;
-use Core::Utils qw( now );
+use Core::Utils qw( now random_bytes );
 
 sub table { return 'sessions' };
+sub dbh { shift->dbh_auto_commit };
 
 sub table_allow_insert_key { return 1 };
 
@@ -29,9 +30,16 @@ sub structure {
 }
 
 sub _generate_id {
-    my @chars =('a' .. 'z', 0 .. 9, 'A' .. 'Z', 0 .. 9);
-    my $session_id = join('', @chars[ map { rand @chars } (1 .. 32) ]);
-
+    my @chars = ('a' .. 'z', 'A' .. 'Z', '0' .. '9');
+    my $n = scalar @chars;
+    my $session_id = '';
+    while ( length($session_id) < 32 ) {
+        for my $byte ( unpack( 'C*', random_bytes(64) ) ) {
+            next if $byte >= int( 256 / $n ) * $n;  # rejection sampling — uniform distribution
+            $session_id .= $chars[ $byte % $n ];
+            last if length($session_id) == 32;
+        }
+    }
     return $session_id;
 }
 
@@ -45,7 +53,6 @@ sub add {
 
     my $session_id = $self->SUPER::add( %args );
 
-    $self->_delete_expired;
     $self->res->{id} = $session_id;
 
     return $session_id;
@@ -73,7 +80,7 @@ sub validate {
     return $session;
 }
 
-sub _delete_expired {
+sub cleanup {
     my $self = shift;
 
     $self->_delete(
@@ -81,12 +88,11 @@ sub _delete_expired {
             updated => { '<', \[ 'NOW() - INTERVAL ? DAY', 3 ] },
         },
     );
+    return $self;
 }
 
 sub delete {
     my $self = shift;
-
-    $self->_delete_expired;
     $self->SUPER::delete( @_ );
 }
 
@@ -114,12 +120,6 @@ sub delete_all {
             user_id => $self->SUPER::user_id,
         },
     );
-}
-
-sub user_id {
-    my $self = shift;
-
-    return $self->res->{user_id};
 }
 
 1;

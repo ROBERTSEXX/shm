@@ -8,6 +8,8 @@ use Core::Utils qw(
     now
     passgen
     switch_user
+    sum_period
+    round
 );
 
 use Core::Billing;
@@ -19,58 +21,134 @@ sub structure {
         user_service_id => {
             type => 'number',
             key => 1,
+            title => 'id услуги пользоватея',
         },
         user_id => {
             type => 'number',
             auto_fill => 1,
+            hide_for_user => 1,
+            title => 'id пользователя услуги',
         },
         service_id => {
             type => 'number',
             required => 1,
+            title => 'id услуги',
+        },
+        service => {
+            type => 'json',
+            virtual => 1,
         },
         auto_bill => {
             type => 'number',
             default => 1,
+            hide_for_user => 1,
+            enum => [0,1],
+            title => 'флаг работы биллинг',
+            description => '0 - биллинг выключен для услуги, 1 - включен',
         },
         withdraw_id => {
             type => 'number',
+            hide_for_user => 1,
+            title => 'id списания',
         },
         created => {
             type => 'now',
+            title => 'дата создания услуги пользователя',
+            readOnly => 1,
+            use_for_stats => 1,
+            stats_mode => 'inc',
+            stats_use_when_add => 1,
         },
         expire => {
             type => 'date',
+            title => 'дата истечения услуги пользователя',
         },
         status_before => {
             type => 'text',
             default => STATUS_INIT,
+            hide_for_user => 1,
+            title => 'предыдущий статус услуги',
+            readOnly => 1,
         },
         status => {
             type => 'text',
             default => STATUS_INIT,
+            enum => [
+                STATUS_INIT,
+                STATUS_WAIT_FOR_PAY,
+                STATUS_PROGRESS,
+                STATUS_ACTIVE,
+                STATUS_BLOCK,
+                STATUS_REMOVED,
+                STATUS_ERROR,
+            ],
+            title => 'статус услуги',
+            readOnly => 1,
         },
         next => {
             type => 'number',
+            title => 'id следующей услуги',
+            description => '-1 - услуга будет удалена',
         },
         parent => {
             type => 'number',
+            title => 'id родительской услуги',
         },
         category => { # virtual field (gets from join)
             type => 'text',
             allow_update_by_user => 0,
+            hide_for_user => 1,
+            title => 'категория услуги',
         },
-        settings => { type => 'json', value => {} },
+        settings => {
+            type => 'json',
+            value => {},
+            hide_for_user => 1,
+            title => 'произвольные настройки услуги',
+        },
+        description => { # virtual field
+            type => 'text',
+            virtual => 1,
+            title => 'заметка пользователя об услуге',
+        },
     };
 }
 
-sub list {
+sub _list {
     my $self = shift;
     my %args = (
         @_,
     );
 
-    $args{where}{status} //= {'!=', STATUS_REMOVED};
-    return $self->SUPER::list( %args );
+    unless ( exists $args{where}{ sprintf("%s.%s", $self->table, $self->get_table_key ) } ||
+             exists $args{where}{ $self->get_table_key }
+    ) {
+        $args{where}{status} //= {'!=', STATUS_REMOVED};
+    }
+    delete $args{where}{status} if $args{where}{status} eq 'ANY';
+    return $self->SUPER::_list( %args );
+}
+
+sub list_for_api {
+    my $self = shift;
+    my %args = (
+        @_,
+    );
+
+    $args{fields} = q(
+        user_services.*,
+            JSON_OBJECT(
+                'name', services.name,
+                'cost', services.cost,
+                'category', services.category
+            ) AS service,
+        JSON_UNQUOTE(JSON_EXTRACT(user_services.settings, '$.description')) AS `description`
+    );
+    $args{join} = { table => 'services', using => ['service_id'] };
+    $args{where}{category} = $args{category} if $args{category};
+
+    my @arr = $self->SUPER::list_for_api( %args );
+    return @arr;
 }
 
 sub settings {
@@ -78,7 +156,7 @@ sub settings {
     my $data = shift;
 
     if ( $data && ref( $data ) eq 'HASH' ) {
-        $self->res->{settings} = { %{ $data }, %{ $self->settings } };
+        $self->res->{settings} = { %{ $self->settings }, %{ $data } };
         return $self;
     }
 
@@ -108,20 +186,49 @@ sub add {
     return $self->srv('us', _id => $usi );
 }
 
+sub api_add_description {
+    my $self = shift;
+    my %args = (
+        description => undef,
+        @_,
+    );
+
+    return undef unless $self->id;
+
+    $self->settings( { description => $args{description} } );
+    $self->settings_save();
+
+    $args{fields} = q(
+        user_services.*,
+        JSON_UNQUOTE(JSON_EXTRACT(user_services.settings, '$.description')) AS `description`
+    );
+    $args{where}{user_service_id} = $self->id;
+
+    my @arr = $self->SUPER::list_for_api( %args );
+    return @arr;
+}
+
 sub can_delete {
     my $self = shift;
+    my %args = (
+        allow_delete_active => 0,
+        @_,
+    );
 
-    return 1 if $self->get_status eq STATUS_ACTIVE ||
-                $self->get_status eq STATUS_BLOCK ||
+    return 1 if $self->get_status eq STATUS_ACTIVE && $args{allow_delete_active};
+    return 1 if $self->get_status eq STATUS_BLOCK ||
                 $self->get_status eq STATUS_WAIT_FOR_PAY;
     return 0;
 }
 
 sub delete {
     my $self = shift;
-    my %args = @_;
+    my %args = (
+        force => 0,
+        @_,
+    );
 
-    unless ( $self->can_delete ) {
+    unless ( $self->can_delete( allow_delete_active => $args{force} ) ) {
         $self->srv('report')->add_error( "Can't delete service with status: " . $self->get_status );
         return undef;
     }
@@ -131,6 +238,8 @@ sub delete {
 
     return scalar $self->get;
 }
+
+sub delete_force { shift->delete( force => 1 ) };
 
 sub has_expired {
     my $self = shift;
@@ -196,6 +305,7 @@ sub has_services_active { shift->has_services( where => { status => STATUS_ACTIV
 sub has_services_block  { shift->has_services( where => { status => STATUS_BLOCK } ) };
 sub has_services_unpaid { shift->has_services( where => { status => STATUS_WAIT_FOR_PAY } ) };
 sub has_services_progress { shift->has_services( where => { status => STATUS_PROGRESS } ) };
+sub has_services_removed { shift->has_services( where => { status => STATUS_REMOVED } ) };
 
 sub child_by_category {
     my $self = shift;
@@ -277,7 +387,7 @@ sub add_domain {
 
 sub billing {
     if ( my $config = get_service('config', _id => 'billing') ) {
-        return $config->get_data->{type};
+        return ucfirst lc $config->get_data->{type} || 'Simpler';
     }
     return "Simpler";
 }
@@ -286,9 +396,21 @@ sub billing {
 sub touch {
     my $self = shift;
     my $e = shift || EVENT_PROLONGATE;
+    my %args = (
+        allow_partial_period => 0,
+        get_smart_args( @_ ),
+    );
 
-    switch_user( $self->user_id );
-    return $self->process_service_recursive( $e );
+    switch_user( $self->get_user_id );
+    return $self->process_service_recursive( $e, %args );
+}
+
+sub touch_api {
+    my $self = shift;
+    my $e = shift || EVENT_PROLONGATE;
+
+    $self->touch( $e );
+    return scalar $self->get;
 }
 
 sub category {
@@ -331,6 +453,8 @@ sub allow_event_by_status {
     my $event = shift || return undef;
     my $status = shift || return undef;
 
+    return undef if $status eq STATUS_REMOVED;
+
     return 1 if $status eq STATUS_PROGRESS;
     return 1 if $event eq EVENT_CHANGED;
     return 1 if $event eq EVENT_CHANGED_TARIFF;
@@ -355,7 +479,7 @@ sub allow_event_by_status {
 
 sub make_commands_by_event {
     my $self = shift;
-    my $e = shift;
+    my $e = uc shift;
     my %args = (
         @_,
     );
@@ -372,9 +496,12 @@ sub make_commands_by_event {
     $args{settings}{server_id} //= $self->settings->{server_id} + 0 if $self->settings->{server_id};
 
     for ( @commands ) {
+        my $prio = delete $_->{settings}->{prio} // 10;
+
         $self->spool->add(
             %args,
             event => $_,
+            prio => $prio,
         );
     }
     return scalar @commands;
@@ -410,6 +537,27 @@ sub event {
     return SUCCESS;
 }
 
+sub cur_event {
+    my $self = shift;
+
+    my $status = $self->get_status;
+    my $status_before = $self->get_status_before;
+
+    return undef if $status ne STATUS_PROGRESS;
+
+    if ( $status_before eq STATUS_INIT ) {
+        return EVENT_CREATE;
+    } elsif ( $status_before eq STATUS_WAIT_FOR_PAY ) {
+        return EVENT_ACTIVATE;
+    } elsif ( $status_before eq STATUS_ACTIVE ) {
+        return EVENT_PROLONGATE if $self->wd->paid;
+        return EVENT_BLOCK;
+    } elsif ( $status_before eq STATUS_BLOCK ) {
+        return EVENT_ACTIVATE;
+    }
+    return undef;
+}
+
 sub last_event {
     my $self = shift;
 
@@ -436,8 +584,13 @@ sub last_event {
 
 sub api_spool_commands {
     my $self = shift;
+    my %args = (
+        user_id => undef,
+        user_service_id => $self->id,
+        @_,
+    );
 
-    my @arr = $self->spool->list_by_settings( user_service_id => $self->id );
+    my @arr = $self->spool->list_by_settings( user_service_id => $args{user_service_id} );
     return @arr;
 }
 
@@ -506,7 +659,10 @@ sub set_status_by_event {
     my $status = status_by_event( $event );
     return $self->get_status unless $status;
 
-    if ( $self->get_status ne $status && $event ne EVENT_PROLONGATE ) {
+    if (    $self->get_status ne $status &&
+            $self->get_status ne STATUS_ERROR &&
+            $event ne EVENT_PROLONGATE
+        ) {
         $self->make_commands_by_event( EVENT_CHANGED,
             settings => {
                 status => {
@@ -583,60 +739,73 @@ sub service {
     return get_service('service', _id => $self->get_service_id);
 }
 
+*services = \&service;
+
 sub make_expired {
     my $self = shift;
 
-    $self->set( expire => now ) unless $self->has_expired;
+    return 0 if $self->get_status eq STATUS_REMOVED;
+    return 0 if $self->has_expired;
+
+    $self->set( expire => now );
 }
 
 sub finish {
     my $self = shift;
     my %args = (
         money_back => 1,
-        @_,
+        get_smart_args( @_ ),
     );
 
     return 0 if $self->get_status ne STATUS_ACTIVE;
     return 0 if $self->has_expired;
 
-    $self->make_expired;
-    $self->money_back if $args{money_back};
+    if ( $self->make_expired ) {
+        $self->money_back if $args{money_back};
+        return 1;
+    }
 
-    return 1;
+    return 0;
 }
 
-sub block {
+*block = \&block_force;
+
+sub block_force {
     my $self = shift;
     my %args = (
         auto_bill => undef,
         get_smart_args( @_ ),
     );
 
-    if ( defined $args{auto_bill} ) {
-        $self->set( auto_bill => int $args{auto_bill} );
+    if ( $self->get_status eq STATUS_ACTIVE ) {
+        $self->set( auto_bill => int $args{auto_bill} ) if defined $args{auto_bill};
+        $self->touch( EVENT_BLOCK_FORCE );
     }
-
-    return scalar $self->get if $self->get_status ne STATUS_ACTIVE;
-
-    $self->touch( EVENT_BLOCK );
 
     return scalar $self->get;
 }
 
-sub activate {
+*activate = \&activate_force;
+
+sub activate_force {
     my $self = shift;
     my %args = (
         auto_bill => undef,
         get_smart_args( @_ ),
     );
 
-    if ( defined $args{auto_bill} ) {
-        $self->set( auto_bill => int $args{auto_bill} );
+    if ($self->get_status eq STATUS_BLOCK) {
+        $self->set( auto_bill => int $args{auto_bill} ) if defined $args{auto_bill};
+
+        if ( $self->has_expired ) {
+            my $event = Core::Billing::prolongate( $self, force => 1 );
+            if ( $event ne EVENT_ACTIVATE ) {
+                report->add_error('Not enough money') unless $event;
+                return;
+            }
+        }
+        $self->touch( EVENT_ACTIVATE_FORCE );
     }
-
-    return scalar $self->get if $self->get_status ne STATUS_BLOCK;
-
-    $self->touch( EVENT_ACTIVATE );
 
     return scalar $self->get;
 }
@@ -679,38 +848,45 @@ sub items {
 
     $args{fields} = '*,user_services.next as next';
     $args{join} = { table => 'services', using => ['service_id'] };
-    $args{where}->{status} ||= {'!=', STATUS_REMOVED};
 
     return $self->SUPER::items( %args );
 }
 
 sub list_for_delete {
     my $self = shift;
-    my %args = (
-        days => 10,
-        @_,
-    );
 
-    return $self->_list(
-        where => { -OR => [
-                {
-                    parent => undef,
-                    auto_bill => 1,
-                    status => STATUS_BLOCK,
-                    expire => {
-                        '<', \[ 'NOW() - INTERVAL ? DAY', $args{days} ],
-                    },
-                },
-                {
-                    parent => undef,
-                    auto_bill => 1,
-                    status => STATUS_WAIT_FOR_PAY,
-                    created =>{
-                        '<', \[ 'NOW() - INTERVAL ? DAY', $args{days} ],
-                    },
-                },
-            ],
-        },
+    my $days_blocked = cfg('billing')->{cleanup}->{ $self->kind }->{block} // 10;
+    my $days_wait_for_pay = cfg('billing')->{cleanup}->{ $self->kind }->{wait_for_pay} // 10;
+
+    my @query;
+
+    if ( $days_blocked ) {
+        push @query, {
+            parent => undef,
+            auto_bill => 1,
+            status => STATUS_BLOCK,
+            expire => {
+                '<', \[ 'NOW() - INTERVAL ? DAY', $days_blocked ],
+            },
+        };
+    }
+
+    if ( $days_wait_for_pay ) {
+        push @query, {
+            parent => undef,
+            auto_bill => 1,
+            status => STATUS_WAIT_FOR_PAY,
+            created =>{
+                '<', \[ 'NOW() - INTERVAL ? DAY', $days_wait_for_pay ],
+            },
+        };
+    }
+
+    return [] unless @query;
+
+    return $self->items(
+        admin => 1,
+        where => { -OR => \@query },
     );
 }
 
@@ -761,6 +937,24 @@ sub api_set {
         delete $args{ $_ } unless $allowed_fields{ $_ };
     }
 
+    # Клиент не может назначить бесплатную услугу тарифом на следующий период:
+    # иначе бесплатный период (cost = 0) продлевается бесконечно.
+    # next = -1 (удалить услугу) и next = 0 (сбросить) остаются разрешёнными.
+    if ( defined $args{next} && !get_service('user')->authenticated->is_admin ) {
+        my $next_id = int( $args{next} );
+        if ( $next_id > 0 ) {
+            my $next_service = $self->srv('service', _id => $next_id );
+            unless ( $next_service && $next_service->get_cost && $next_service->get_cost > 0 ) {
+                logger->warning(
+                    sprintf "Denied next=%s (free service) for user service: %s", $args{next}, $self->id
+                );
+                report->status( 403 );
+                report->add_error('The next service must not be free');
+                return undef;
+            }
+        }
+    }
+
     return $self->SUPER::api_set( %args );
 }
 
@@ -768,8 +962,12 @@ sub change {
     my $self = shift;
     my %args = (
         service_id => undef,
+        finish_active => 1,
+        allow_partial_period => 0,
         get_smart_args( @_ ),
     );
+
+    return undef unless $self->id;
 
     my $service = $self->srv('service', _id => $args{service_id} );
     unless ( $service ) {
@@ -777,28 +975,34 @@ sub change {
         return undef;
     }
 
-    if ( $self->get_status eq STATUS_WAIT_FOR_PAY ||
-         $self->get_status eq STATUS_BLOCK ) {
-
-        if ( my $wd = $self->withdraw ) {
-            my %wd = Core::Billing::calc_withdraw( $self->billing, $service->get );
-            delete @wd{ qw/ withdraw_id create_date end_date withdraw_date / };
-            $wd->set( %wd );
+    # Смена тарифа на бесплатный доступна только администратору. Иначе клиент
+    # переключается на бесплатную услугу (в том числе из статуса BLOCK) и
+    # пользуется ей бесконечно: order_only_once тут не помогает, эта проверка
+    # живёт только в Core::Service::price_list, а change её не вызывает.
+    unless ( get_service('user')->authenticated->is_admin ) {
+        unless ( $service->get_cost && $service->get_cost > 0 ) {
+            logger->warning(
+                sprintf "Denied change to free service %s for user service: %s", $args{service_id}, $self->id
+            );
+            report->status( 403 );
+            report->add_error('Switching to a free service is not allowed');
+            return undef;
         }
+    }
 
-        $self->set(
-            service_id => $service->id,
-            next => $service->get_next,
+    $self->set( next => $service->id );
+
+    if ( $self->get_status eq STATUS_WAIT_FOR_PAY || $self->get_status eq STATUS_BLOCK ) {
+        Core::Billing::switch_to_next_service( $self,
+            allow_partial_period => $args{allow_partial_period},
         );
-        $self->make_commands_by_event( EVENT_CHANGED_TARIFF );
     } elsif ( $self->get_status eq STATUS_ACTIVE ) {
-        $self->set( next => $service->id );
-        $self->finish;
+        $self->finish if $args{finish_active};
     } else {
         return undef;
     }
 
-    $self->touch;
+    $self->touch( EVENT_PROLONGATE, %args );
     return 1;
 }
 
@@ -814,23 +1018,21 @@ sub create {
         get_smart_args( @_ ),
     );
 
-    unless( $self->srv('service', _id => $args{service_id} )) {
-        logger->warning('service not exists:', $args{service_id} );
-        $self->srv('report')->add_error('service not exists:', $args{service_id} );
+    my $service = get_service('service', _id => $args{service_id} );
+    unless( $service ) {
+        report->add_error('service not exists:', $args{service_id} );
         return undef;
     }
 
     unless ( get_service('user')->authenticated->is_admin ) {
         if ( $args{check_allow_to_order} ) {
-            my $allowed_services_list = $self->srv('service')->price_list;
-            unless ( exists $allowed_services_list->{ $args{service_id} } ) {
-                logger->warning('Attempt to register not allowed service', $args{service_id} );
+            unless ( $service->price_list_check_allow_to_order ) {
+                report->status( 403 );
+                report->add_error('The service is prohibited for registration' );
                 return undef;
             }
         }
     }
-
-    # order_only_once
 
     my $us;
 
@@ -886,31 +1088,53 @@ sub create_for_api_safe {
         @_,
     );
 
-    return $self->create_for_api(
+    $self->set_user_fail_attempt( 'create_for_api_safe', 600 ); # 5 orders/10 mins
+
+    my $us = $self->create_for_api(
         service_id => $args{service_id},
         check_allow_to_order => 1,
     );
+
+    $self = $self->id( $us->{user_service_id} );
+
+    return $self ? {
+        name => $self->name,
+        $self->get,
+    } : undef;
 }
 
 sub make_custom_event {
     my $self = shift;
     my %args = (
         event => 'custom',
+        name => '',
         title => 'custom event',
+        prio => 100,
+        delay => 0,
+        template_id => undef,
+        transport => undef,
+        settings => {},
         get_smart_args( @_ ),
     );
 
-    return undef unless $self->server;
+    my $server = $self->server;
+    unless ($args{transport} && $args{template_id}) {
+        return undef unless $server;
+    }
 
     return $self->srv('spool')->create(
-        prio => 100,
+        prio => $args{prio} || 100,
+        $args{delay} ? ( delayed => $args{delay}, executed => now ) : (), # set executed for calculating next run
         event => {
-            name => $args{event},
+            name => $args{name} || $args{event},
             title => $args{title},
         },
         settings => {
+            %{ $args{settings} || {} },
+            $args{transport} ? (transport => lc $args{transport}) : (),
+            $args{template_id} ? (template_id => $args{template_id}) : (),
+            $server ? (server_id => $self->server->id) : (),
             user_service_id => $self->id,
-            server_id => $self->server->id,
         },
     );
 }
@@ -928,16 +1152,78 @@ sub recalc {
         return;
     }
 
+    return if $self->get_status eq STATUS_REMOVED;
+
     if ( my $wd = $self->withdraw ) {
         return unless $wd->unpaid;
-        switch_user( $self->user_id );
+        switch_user( $self->get_user_id );
         my %new_wd = Core::Billing::calc_withdraw( $self->billing, $self->service->get, %args );
-        delete @new_wd{ qw/ withdraw_id create_date end_date withdraw_date / };
+        delete @new_wd{ qw/ withdraw_id create_date end_date withdraw_date user_id service_id user_service_id/ };
         $wd->set( %new_wd );
         $self->touch();
     }
 
     return;
+}
+
+sub add_period_by_money {
+    my $self = shift;
+    my $money = shift || 0;
+
+    return undef if $self->status ne STATUS_ACTIVE;
+    return undef if $money <= 0;
+
+    return undef unless $self->withdraw;
+    my %wd = $self->withdraw->get;
+
+    my $cost = round( $wd{cost} - $wd{cost} * $wd{discount} / 100 );
+
+    my $period = Core::Billing::calc_period_by_total(
+        $self->billing,
+        cost => $cost,
+        period => $self->service->get_period,
+        total => $money,
+    );
+    return undef if $period eq "0.0000";
+
+    my $months = sum_period( $wd{months}, $period );
+
+    my $expire_date = Core::Billing::calc_end_date_by_months(
+        $self->billing,
+        $wd{withdraw_date},
+        $months,
+    );
+
+    $self->withdraw->set(
+        months => $months,
+        total => $wd{total} + $money,
+        end_date => $expire_date,
+    );
+
+    $self->set( expire => $expire_date );
+    $self->user->set_balance( balance => -$money );
+    $self->make_commands_by_event( EVENT_PROLONGATE );
+
+    return 1;
+}
+
+sub cleanup {
+    my $self = shift;
+
+    my $arr = $self->list_for_delete();
+    for my $us ( @$arr ) {
+        logger->debug( sprintf("Cleanup us: %d %d %s %s",
+                $us->user_id,
+                $us->id,
+                $us->get_created,
+                $us->get_expire,
+            )
+        );
+        next unless $us->lock();
+        $us->delete;
+        $us->commit;
+    }
+    return $self;
 }
 
 1;

@@ -7,6 +7,9 @@ use Core::Base;
 use Core::Const;
 use Core::Utils qw(
     switch_user
+    add_date_time
+    start_of_day
+    round_up
 );
 
 sub table { return 'pays_history' };
@@ -16,27 +19,38 @@ sub structure {
         id => {
             type => 'number',
             key => 1,
+            title => 'id платежа',
         },
         user_id => {
             type => 'number',
             auto_fill => 1,
+            title => 'id пользователя',
         },
         pay_system_id => {
             type => 'text',
+            title => 'id платежной системы',
         },
         money => {
             type => 'number',
             required => 1,
+            title => 'сумма платежа',
+            use_for_stats => 1,
+            stats_use_when_add => 1,
         },
         date => {
             type => 'now',
+            title => 'дата платежа',
         },
         comment => {
             type => 'json',
             value => undef,
+            hide_for_user => 1,
+            title => 'комментарии',
         },
         uniq_key => {
             type => 'text',
+            hide_for_user => 1,
+            title => 'уникальный ключ платежа',
         }
     }
 }
@@ -79,15 +93,15 @@ sub pays {
     return $self;
 }
 
-sub forecast {
+sub forecast_candidates {
     my $self = shift;
     my %args = (
         days => 3,
+        consider_today => 0,
         blocked => 0,
+        distinct_users => 0,
         get_smart_args(@_),
     );
-
-    my $user = $self->user;
 
     my @statuses = (
         STATUS_INIT,
@@ -98,21 +112,49 @@ sub forecast {
 
     push @statuses, STATUS_BLOCK if $args{blocked};
 
-    my $user_services = get_service('UserService', user_id => $self->user_id )->list_prepare(
-        where => {
-            auto_bill => \[ '= 1'],
-            status => { -in => \@statuses },
-            withdraw_id => { '!=', undef },
-            expire => [
-                { '<', \[ 'NOW() + INTERVAL ? DAY', $args{days} ] },
-                undef,
-            ],
-        },
+    my $start_date = add_date_time( start_of_day(), day => $args{consider_today} ? 0 : 1 );
+
+    my $where = {
+        auto_bill => \[ '= 1'],
+        status => { -in => \@statuses },
+        withdraw_id => { '!=', undef },
+        expire => [
+            { '<', \[ '? + INTERVAL ? DAY', $start_date, $args{days} ] },
+            undef,
+        ],
+    };
+
+    if ( $args{distinct_users} ) {
+        my @rows = $self->srv('us')->_list(
+            where => $where,
+            fields => 'DISTINCT user_id',
+        );
+        return \@rows;
+    }
+
+    return get_service('UserService', user_id => $self->user_id )->list_prepare(
+        where => $where,
         order => [
             user_service_id => 'asc',
             expire => 'asc',
         ],
     )->with('services','withdraws','settings')->get;
+}
+
+sub forecast {
+    my $self = shift;
+    my %args = (
+        days => 3,
+        consider_today => 0,
+        blocked => 0,
+        get_smart_args(@_),
+    );
+
+    my $user = $self->user;
+
+    my $user_services = $self->forecast_candidates(%args);
+
+    my $bonus = $user->get_bonus,
 
     my @forecast_services;
 
@@ -121,18 +163,29 @@ sub forecast {
         next if $obj->{next} == -1 && $obj->{expire};
 
         my $us = get_service('us', user_id => $self->user_id, _id => $usi );
+        next unless $us;
 
-        my %wd = %{ $obj->{withdraws} || {} };
+        my $wd = $us->withdraw;
+        unless ( $wd ) {
+            logger->error( sprintf("Withdraw not exists! usi=%d, wd_id=%d", $usi, $us->get_withdraw_id) );
+            next;
+        }
+
+        my %wd = $wd->get;
+        $wd{months} = $us->service->get_period;
+
+        my $service_next = $us->service;
         my $service_next_name = $obj->{services}->{name};
 
-        if ( $obj->{expire} ) {
+        if ( $us->wd->paid ) {
             # Check next pays
             if ( my %wd_next = $us->withdraw->next ) {
                 # Skip if already paid for
                 next if $wd_next{withdraw_date};
                 %wd = %wd_next;
             } elsif ( $obj->{next} ) {
-                if ( my $service_next = get_service('service', _id => $obj->{next} ) ) {
+                if ( my $s_next = get_service('service', _id => $obj->{next} ) ) {
+                    $service_next = $s_next;
                     $wd{service_id} = $service_next->id;
                     $wd{cost} = $service_next->get_cost;
                     $wd{months} = $service_next->get_period;
@@ -149,6 +202,15 @@ sub forecast {
             $us->billing,
             %wd,
         );
+
+        my $total = $wd_forecast{total};
+        my $calc_bonuses = Core::Billing::calc_available_bonuses( $service_next, $bonus, $total );
+        if ( $calc_bonuses >= $total ) {
+            $total = 0;
+        } else {
+            $total -= $calc_bonuses;
+        }
+        $bonus -= $calc_bonuses;
 
         push @forecast_services, {
             name => $obj->{services}->{name},
@@ -169,16 +231,18 @@ sub forecast {
                 months => $wd_forecast{months},
                 qnt => $wd_forecast{qnt},
                 discount => $wd_forecast{discount},
-                total => $wd_forecast{total},
+                bonus => $calc_bonuses,
+                total => $total,
             },
-        } if $wd_forecast{total};
-
+        } if $total;
     }
 
+   my $balance = $user->get_balance;
+
     my %ret = (
-        balance => $user->get_balance,
+        balance => $balance,
         bonuses => $user->get_bonus,
-        total => 0,
+        total => 0,                     # amount to be paid
         items => \@forecast_services,
     );
 
@@ -186,21 +250,19 @@ sub forecast {
         $ret{total} += $_->{next}->{total};
     }
 
-    my $total = $user->get_balance + $user->get_bonus;
-
-    if ( $total > 0 ) {
-        $ret{total} -= $total;
+    if ( defined $balance && $balance > 0 ) {
+        $ret{total} -= $balance;
         $ret{total} = 0 if $ret{total} < 0;
     } else {
-        $ret{dept} = abs( $total );
+        $ret{dept} = abs( $balance );
         $ret{total} += $ret{dept};
     }
 
     # Do not send forecast if services not expired or not exists
     $ret{total} = 0 unless scalar @forecast_services;
 
-    $ret{dept} = sprintf("%.2f", $ret{dept} ) + 0 if $ret{dept};
-    $ret{total} = sprintf("%.2f", $ret{total} ) + 0;
+    $ret{dept} = round_up( $ret{dept} ) if $ret{dept};
+    $ret{total} = round_up( $ret{total} );
 
     return \%ret;
 }
@@ -226,11 +288,12 @@ sub paysystems {
     );
 
     my @ps;
+    my %recurring;
 
-    my $config = get_service("config", _id => 'pay_systems');
-    my %list = %{ $config ? $config->get_data : {} };
+    my %list = cfg('pay_systems');
     for ( keys %list ) {
         push @ps, { $_ => $list{ $_ } };
+        $recurring{ $_ } = 1 if $list{ $_ }->{allow_recurring};
     }
 
     my $forecast = $self->forecast( blocked => 1 )->{total};
@@ -240,11 +303,22 @@ sub paysystems {
 
     my $user = get_service('user', _id => $args{user_id} );
 
+    # Add user pay_systems (recurring payments)
+    my %user_paysystem = %{ $user->get_settings->{pay_systems} || {} };
+    for ( keys %user_paysystem ) {
+        $user_paysystem{ $_ }->{show_for_client} = 1;
+        $user_paysystem{ $_ }->{weight} = 100;
+        $user_paysystem{ $_ }->{action} = $recurring{ $_ } ? 'payment' : '';
+        $user_paysystem{ $_ }->{recurring} = $recurring{ $_ } ? 1 : 0;
+        $user_paysystem{ $_ }->{allow_deletion} = 1;
+        push @ps, { $_ => $user_paysystem{ $_ } };
+    }
+
     for ( @ps ) {
-        my ( $paysystem, $p ) = each( %$_ );
+        my ( $ps, $p ) = each( %$_ );
 
         # allow override paysystem
-        $paysystem = $p->{paysystem} if $p->{paysystem};
+        my $paysystem = $p->{paysystem} || $ps;
 
         if ( $args{paysystem} ) {
             next if $paysystem ne $args{paysystem};
@@ -254,18 +328,26 @@ sub paysystems {
 
         my $proposed_payment = $args{amount} || $forecast;
 
+        my $payment_mode = $p->{payment_mode};
+        if ( $p->{recurring} || $p->{internal} ) {
+            $payment_mode //= 'internal';
+        }
+
         push @ret, {
             paysystem => $paysystem,
             weight => $p->{weight} || 0,
             name => $p->{name} || $paysystem,
-            shm_url => sprintf('%s?action=%s&user_id=%s&ts=%s&amount=%s',
+            shm_url => sprintf('%s?action=%s&user_id=%s&ts=%s&ps=%s&amount=%s',
                 $p->{payment_url} || get_service('config')->data_by_name('api')->{url} . "/shm/pay_systems/$paysystem.cgi",
                 $p->{action} ? $p->{action} : 'create',
                 $user->id,
                 $ts,
+                $ps,
                 ( $args{pp} ? $proposed_payment : '' ),
             ),
-            recurring => 0,
+            recurring => $p->{recurring} ? 1 : 0,
+            internal => $p->{internal} ? 1 : 0,
+            payment_mode => $payment_mode,
             allow_deletion => $p->{allow_deletion} ? 1 : 0,
             user_id => $user->id,
             forecast => $forecast,
@@ -273,7 +355,10 @@ sub paysystems {
         };
     }
 
-    return sort { $b->{weight} <=> $a->{weight} } @ret;
+    my @sorted = sort { $b->{weight} <=> $a->{weight} } @ret;
+    return \@sorted; # always return ref for templates (wantarray is not suitable for templates)
 }
+
+sub api_paysystems { @{ shift->paysystems } };
 
 1;

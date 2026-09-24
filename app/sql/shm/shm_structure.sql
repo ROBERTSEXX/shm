@@ -1,8 +1,7 @@
 BEGIN;
 SET FOREIGN_KEY_CHECKS = 0;
 
-DROP TABLE IF EXISTS `acts`;
-CREATE TABLE `acts` (
+CREATE TABLE IF NOT EXISTS `acts` (
   `act_id` int(11) NOT NULL AUTO_INCREMENT,
   `user_id` int(11) NOT NULL,
   `date` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -11,8 +10,7 @@ CREATE TABLE `acts` (
   PRIMARY KEY (`act_id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `acts_data`;
-CREATE TABLE `acts_data` (
+CREATE TABLE IF NOT EXISTS `acts_data` (
   `id` int(10) unsigned NOT NULL AUTO_INCREMENT,
   `act_id` int(10) unsigned DEFAULT NULL,
   `user_id` int(11) NOT NULL,
@@ -27,8 +25,7 @@ CREATE TABLE `acts_data` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `apps`;
-CREATE TABLE `apps` (
+CREATE TABLE IF NOT EXISTS `apps` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `user_id` int(11) NOT NULL,
   `user_service_id` int(11) NOT NULL,
@@ -39,18 +36,16 @@ CREATE TABLE `apps` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `discounts`;
-CREATE TABLE `discounts` (
+CREATE TABLE IF NOT EXISTS `discounts` (
   `discount_id` tinyint(4) NOT NULL AUTO_INCREMENT,
   `title` char(64) NOT NULL,
   `months` decimal(10,4) NOT NULL,
   `percent` tinyint(4) NOT NULL,
   `share` tinyint(4) DEFAULT NULL,
   PRIMARY KEY (`discount_id`)
-) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `dns_services`;
-CREATE TABLE `dns_services` (
+CREATE TABLE IF NOT EXISTS `dns_services` (
   `dns_id` int(11) NOT NULL AUTO_INCREMENT,
   `domain_id` int(11) NOT NULL,
   `domain` char(255) DEFAULT NULL,
@@ -60,10 +55,9 @@ CREATE TABLE `dns_services` (
   `ttl` tinyint(4) DEFAULT NULL,
   FOREIGN KEY (domain_id) REFERENCES domains (domain_id),
   PRIMARY KEY (`dns_id`)
-) ENGINE=MyISAM AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `domains`;
-CREATE TABLE `domains` (
+CREATE TABLE IF NOT EXISTS `domains` (
   `domain_id` int(11) NOT NULL AUTO_INCREMENT,
   `user_id` int(11) NOT NULL,
   `domain` char(64) NOT NULL,
@@ -75,20 +69,18 @@ CREATE TABLE `domains` (
   FOREIGN KEY (user_id) REFERENCES users (user_id),
   PRIMARY KEY (`domain_id`),
   UNIQUE KEY `domain` (`domain`)
-) ENGINE=MyISAM AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `domains_services`;
-CREATE TABLE `domains_services` (
+CREATE TABLE IF NOT EXISTS `domains_services` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `domain_id` int(11) NOT NULL,
   `user_service_id` int(11) NOT NULL,
   `created` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   UNIQUE KEY `domain_service_id` (`domain_id`,`user_service_id`)
-) ENGINE=MyISAM AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `invoices`;
-CREATE TABLE `invoices` (
+CREATE TABLE IF NOT EXISTS `invoices` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `date` int(11) DEFAULT NULL,
   `user_id` int(11) DEFAULT NULL,
@@ -98,8 +90,7 @@ CREATE TABLE `invoices` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `pays_history`;
-CREATE TABLE `pays_history` (
+CREATE TABLE IF NOT EXISTS `pays_history` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `user_id` int(11) NOT NULL,
   `pay_system_id` char(32) DEFAULT NULL,
@@ -111,8 +102,7 @@ CREATE TABLE `pays_history` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `servers`;
-CREATE TABLE `servers` (
+CREATE TABLE IF NOT EXISTS `servers` (
   `server_id` int(11) NOT NULL AUTO_INCREMENT,
   `server_gid` int(11) DEFAULT NULL,
   `name` char(255) DEFAULT NULL,
@@ -128,18 +118,16 @@ CREATE TABLE `servers` (
   PRIMARY KEY (`server_id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `servers_groups`;
-CREATE TABLE `servers_groups` (
+CREATE TABLE IF NOT EXISTS `servers_groups` (
   `group_id` int(11) NOT NULL AUTO_INCREMENT,
   `name` char(255) DEFAULT NULL,
   `transport` char(32) NOT NULL DEFAULT 'ssh',
   `type` char(16) NOT NULL DEFAULT 'random',
   `settings` json DEFAULT NULL,
   PRIMARY KEY (`group_id`)
-) ENGINE=MyISAM AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `services`;
-CREATE TABLE `services` (
+CREATE TABLE IF NOT EXISTS `services` (
   `service_id` int(11) NOT NULL AUTO_INCREMENT,
   `name` char(64) NOT NULL,
   `cost` decimal(10,2) DEFAULT NULL,
@@ -160,8 +148,7 @@ CREATE TABLE `services` (
   PRIMARY KEY (`service_id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `events`;
-CREATE TABLE `events` (
+CREATE TABLE IF NOT EXISTS `events` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `kind` char(32) NOT NULL,
   `title` char(128) NOT NULL,
@@ -171,8 +158,26 @@ CREATE TABLE `events` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `spool`;
-CREATE TABLE `spool` (
+CREATE TABLE IF NOT EXISTS `spool_queues` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `name` varchar(255) NOT NULL,
+  `rate_limit` float DEFAULT NULL COMMENT 'max tasks per second, NULL = unlimited',
+  `status` enum('active','paused') NOT NULL DEFAULT 'active',
+  `last_executed_at` datetime DEFAULT NULL COMMENT 'last time a task from this queue was executed',
+  `created_at`       datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `finished_at`      datetime DEFAULT NULL COMMENT 'set automatically when no pending tasks remain',
+  `total_added`  int(11) NOT NULL DEFAULT '0',
+  `cnt_success`  int(11) NOT NULL DEFAULT '0',
+  `cnt_fail`     int(11) NOT NULL DEFAULT '0',
+  `cnt_delayed`  int(11) NOT NULL DEFAULT '0',
+  `cnt_stuck`    int(11) NOT NULL DEFAULT '0',
+  `cnt_paused`   int(11) NOT NULL DEFAULT '0',
+  `cnt_skipped`  int(11) NOT NULL DEFAULT '0',
+  `cnt_pending`  int(11) NOT NULL DEFAULT '0' COMMENT 'tasks not yet terminally finished',
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `spool` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `user_id` int(11) NOT NULL,
   `user_service_id` int(11) DEFAULT NULL,
@@ -184,11 +189,13 @@ CREATE TABLE `spool` (
   `executed` datetime DEFAULT NULL,
   `delayed` int(11) NOT NULL DEFAULT '0',
   `settings` json DEFAULT NULL,
-  PRIMARY KEY (`id`)
+  `queue_id` int(11) DEFAULT NULL,
+  KEY idx_spool_select (`prio`,`status`,`delayed`,`executed`,`queue_id`),
+  PRIMARY KEY (`id`),
+  CONSTRAINT `fk_spool_queue` FOREIGN KEY (`queue_id`) REFERENCES `spool_queues` (`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `spool_history`;
-CREATE TABLE `spool_history` (
+CREATE TABLE IF NOT EXISTS `spool_history` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `spool_id` int(11) NOT NULL,
   `user_id` int(11) NOT NULL,
@@ -201,11 +208,11 @@ CREATE TABLE `spool_history` (
   `executed` datetime DEFAULT NULL,
   `delayed` int(11) NOT NULL DEFAULT '0',
   `settings` json DEFAULT NULL,
+  `queue_id` int(11) DEFAULT NULL,
   PRIMARY KEY (`id`)
-) ENGINE=MyISAM AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `user_services`;
-CREATE TABLE `user_services` (
+CREATE TABLE IF NOT EXISTS `user_services` (
   `user_service_id` int(11) NOT NULL AUTO_INCREMENT,
   `user_id` int(11) NOT NULL,
   `service_id` int(11) NOT NULL,
@@ -219,19 +226,25 @@ CREATE TABLE `user_services` (
   `parent` int(11) DEFAULT NULL,
   `settings` json DEFAULT NULL,
   PRIMARY KEY (`user_service_id`),
-  FOREIGN KEY (user_id) REFERENCES users (user_id),
-  FOREIGN KEY (service_id) REFERENCES services (service_id),
   FOREIGN KEY (parent) REFERENCES user_services (user_service_id) ON DELETE SET NULL,
-  FOREIGN KEY (withdraw_id) REFERENCES withdraw_history (withdraw_id),
-  UNIQUE KEY `user_services_idx` (`user_service_id`,`user_id`,`service_id`)
+  KEY `idx_user_id` (`user_id`),
+  KEY `idx_forecast_candidates` (`auto_bill`, `status`, `withdraw_id`, `expire`, `user_id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `users`;
-CREATE TABLE `users` (
+CREATE TABLE IF NOT EXISTS `user_groups` (
+  `gid` int(11) NOT NULL AUTO_INCREMENT,
+  `name` char(255) NOT NULL,
+  `is_admin` tinyint(4) NOT NULL DEFAULT '0',
+  `default_policy` char(8) NOT NULL DEFAULT 'allow',
+  `rules` json DEFAULT NULL,
+  PRIMARY KEY (`gid`)
+) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `users` (
   `user_id` int(11) NOT NULL AUTO_INCREMENT,
   `partner_id` int(11) DEFAULT NULL,
-  `login` char(64) NOT NULL,
-  `password` char(64) DEFAULT NULL,
+  `login` varchar(128) NOT NULL,
+  `password` varchar(128) DEFAULT NULL,
   `type` tinyint(4) DEFAULT NULL,
   `created` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `last_login` datetime DEFAULT NULL,
@@ -241,21 +254,38 @@ CREATE TABLE `users` (
   `comment` char(255) DEFAULT NULL,
   `dogovor` char(32) DEFAULT NULL,
   `block` tinyint(4) NOT NULL DEFAULT '0',
-  `gid` tinyint(4) DEFAULT NULL,
+  `gid` tinyint(4) NOT NULL DEFAULT '2',
   `perm_credit` tinyint(4) DEFAULT '0',
   `full_name` char(255) DEFAULT NULL,
   `can_overdraft` tinyint(4) DEFAULT '0',
   `bonus` decimal(10,2) NOT NULL,
-  `phone` char(20) DEFAULT NULL,
   `verified` int(11) DEFAULT NULL,
   `create_act` tinyint(4) DEFAULT NULL,
   `settings` json DEFAULT NULL,
-  PRIMARY KEY (`user_id`),
-  UNIQUE KEY `users_uniq` (`login`)
+  PRIMARY KEY (`user_id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `withdraw_history`;
-CREATE TABLE `withdraw_history` (
+CREATE TABLE IF NOT EXISTS `accounts` (
+  `login` varchar(128) NOT NULL,
+  `type` char(16) NOT NULL DEFAULT 'login',
+  `user_id` int(11) NOT NULL,
+  `settings` json DEFAULT NULL,
+  PRIMARY KEY (`login`, `type`),
+  KEY `idx_accounts_user_id` (`user_id`),
+  CONSTRAINT `fk_accounts_user_id` FOREIGN KEY (`user_id`) REFERENCES `users` (`user_id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `accounts` (
+  `login` varchar(128) NOT NULL,
+  `type` char(16) NOT NULL DEFAULT 'login',
+  `user_id` int(11) NOT NULL,
+  `settings` json DEFAULT NULL,
+  PRIMARY KEY (`login`, `type`),
+  KEY `idx_accounts_user_id` (`user_id`),
+  CONSTRAINT `fk_accounts_user_id` FOREIGN KEY (`user_id`) REFERENCES `users` (`user_id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `withdraw_history` (
   `withdraw_id` int(11) NOT NULL AUTO_INCREMENT,
   `user_id` int(11) NOT NULL,
   `create_date` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -268,14 +298,13 @@ CREATE TABLE `withdraw_history` (
   `total` decimal(10,2) NOT NULL DEFAULT '0.00',
   `service_id` int(11) NOT NULL,
   `qnt` double NOT NULL DEFAULT '1',
-  `user_service_id` int(11) DEFAULT NULL,
-  FOREIGN KEY (user_id) REFERENCES users (user_id),
-  FOREIGN KEY (service_id) REFERENCES services (service_id),
-  PRIMARY KEY (`withdraw_id`)
+  `user_service_id` int(11) NOT NULL,
+  PRIMARY KEY (`withdraw_id`),
+  KEY idx_user_id_service_id (`user_id`,`service_id`),
+  KEY idx_user_id_user_service_id (`user_id`,`user_service_id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `zones`;
-CREATE TABLE `zones` (
+CREATE TABLE IF NOT EXISTS `zones` (
   `zone_id` int(11) NOT NULL AUTO_INCREMENT,
   `name` char(32) NOT NULL,
   `order` tinyint(4) NOT NULL DEFAULT '0',
@@ -290,37 +319,34 @@ CREATE TABLE `zones` (
   `idn` tinyint(4) DEFAULT '0',
   `punycode_only` tinyint(4) DEFAULT '0',
   PRIMARY KEY (`zone_id`)
-) ENGINE=MyISAM AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `identities`;
-CREATE TABLE `identities` (
+CREATE TABLE IF NOT EXISTS `identities` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `name` char(64) NOT NULL,
   `private_key` text NOT NULL,
   `public_key` text,
   `fingerprint` char(128),
   PRIMARY KEY (`id`)
-) ENGINE=MyISAM AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE `templates` (
+CREATE TABLE IF NOT EXISTS `templates` (
   `id` char(32) NOT NULL,
   `data` MEDIUMTEXT DEFAULT NULL, -- Up to 16 Mb
   `settings` json DEFAULT NULL,
   PRIMARY KEY (`id`)
-) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `console`;
-CREATE TABLE `console` (
+CREATE TABLE IF NOT EXISTS `console` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `start` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `stop` datetime DEFAULT NULL,
   `log` MEDIUMBLOB NOT NULL,
   `eof` boolean DEFAULT 0,
   PRIMARY KEY (`id`)
-) ENGINE=MyISAM AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
-DROP TABLE IF EXISTS `profiles`;
-CREATE TABLE `profiles` (
+CREATE TABLE IF NOT EXISTS `profiles` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `user_id` int(11) DEFAULT NULL,
   `data` json DEFAULT NULL,
@@ -333,7 +359,7 @@ CREATE TABLE IF NOT EXISTS `config` (
   `key` char(32) NOT NULL,
   `value` json DEFAULT NULL,
   PRIMARY KEY (`key`)
-) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS `sessions` (
   `id` char(32) NOT NULL,
@@ -342,7 +368,7 @@ CREATE TABLE IF NOT EXISTS `sessions` (
   `updated` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `settings` json DEFAULT NULL,
   PRIMARY KEY (`id`)
-) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS `storage` (
   `user_id` int(11) NOT NULL,
@@ -360,7 +386,7 @@ CREATE TABLE IF NOT EXISTS `bonus_history` (
   `date` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `bonus` decimal(10,2) NOT NULL,
   `comment` json DEFAULT NULL,
-  FOREIGN KEY (user_id) REFERENCES users (user_id),
+  KEY idx_user_id (user_id),
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
@@ -376,4 +402,32 @@ CREATE TABLE IF NOT EXISTS `promo_codes` (
   PRIMARY KEY (`id`,`user_id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS `logs_api` (
+  `user_id` int(11) DEFAULT NULL,
+  `date` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `ip` varchar(45) NOT NULL,
+  `url` varchar(512) NOT NULL,
+  `method` varchar(10) NOT NULL,
+  `args` json DEFAULT NULL,
+  `descr` char(128) DEFAULT NULL,
+  `duration` int(11) unsigned NOT NULL DEFAULT '0',
+  `response_code` smallint(5) unsigned NOT NULL DEFAULT '0',
+  `response_error` varchar(512) DEFAULT NULL,
+  KEY `idx_logs_api_user_id` (`user_id`),
+  KEY `idx_logs_api_date` (`date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `statistics` (
+  `date` date NOT NULL,
+  `kind` varchar(32) NOT NULL,
+  `field` varchar(64) NOT NULL,
+  `count` int(11) NOT NULL DEFAULT '0',
+  `sum` decimal(12,2) NOT NULL DEFAULT '0.00',
+  `min` decimal(12,2) NOT NULL DEFAULT '0.00',
+  `max` decimal(12,2) NOT NULL DEFAULT '0.00',
+  `avg` decimal(12,2) NOT NULL DEFAULT '0.00',
+  UNIQUE KEY (`date`, `kind`, `field`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+SET FOREIGN_KEY_CHECKS = 1;
 COMMIT;

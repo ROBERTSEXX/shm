@@ -13,29 +13,35 @@ use Data::Dumper;
 use Core::Utils qw(
     hash_merge
     encode_json
-    hash_merge
     dots_str_to_sql
+    get_user_ip
+    is_ip_allowed
+    trusted_ips
 );
 $Data::Dumper::Deepcopy = 1;
 
 our @EXPORT = qw(
     get_service
+    cfg
     Dumper
     confess
     logger
     report
+    cache
     get_smart_args
     first_item
+    stats
 );
 
 use vars qw($AUTOLOAD);
+sub DESTROY {}; # ignore destroy destructor
 sub AUTOLOAD {
     my $self = shift;
 
     if ( $AUTOLOAD =~ /^.*::(get_)?(\w+)$/ ) {
         my $method = $2;
 
-        unless ( my %res = $self->res ) {
+        unless ( %{ $self->res } ) {
             # load data if not loaded before
             $self->get if $self->can('structure');
         }
@@ -47,8 +53,6 @@ sub AUTOLOAD {
             return $structure->{ $method }->{value}; # return default value from struct
         }
         return undef;
-    } elsif ( $AUTOLOAD=~/::DESTROY$/ ) {
-        # Skip
     } else {
         confess ("Method not exists: " . $AUTOLOAD );
     }
@@ -81,6 +85,8 @@ sub new {
     my $class = ref($proto) || $proto;
     my $self = bless( $args, $class );
 
+    $self->init( %$args ) if $self->can('init');
+
     # Устанавливаем идентификатор автоматически
     if ( $class->can('structure') ) {
         my $key = $class->get_table_key;
@@ -92,9 +98,6 @@ sub new {
         }
     }
 
-    if ( $self->can('init') ) {
-        return $self->init( %{ $args } );
-    }
     return $self;
 }
 
@@ -131,7 +134,7 @@ sub id {
 
 sub user_id {
     my $self = shift;
-    return $self->{user_id} || $self->res->{user_id} || get_service('config')->local->{user_id};
+    return $self->res->{user_id} || $self->{user_id} || get_service('config')->local->{user_id};
 }
 
 sub user {
@@ -169,6 +172,21 @@ sub filter {
     }
 
     $self->{filter} = \%args;
+    return $self;
+}
+
+sub limit {
+    my $self = shift;
+    my $limit = shift;
+    my $offset = shift;
+
+    unless ( $limit ) {
+        return delete $self->{limit}, delete $self->{offset};
+    }
+
+    $self->{limit} = int $limit;
+    $self->{offset} = int $offset;
+
     return $self;
 }
 
@@ -214,10 +232,14 @@ sub get {
     return wantarray ? %{ $self->{res} } : $self->{res};
 }
 
+# Method for templates. It always gets scalar
+sub pairs { scalar shift->get }
+
 sub items {
     my $self = shift;
     my %args = (
         where => {},
+        admin => 0,
         get_smart_args( @_ ),
     );
 
@@ -226,9 +248,13 @@ sub items {
         %{$self->query_for_filtering( $self->filter )},
     };
 
+    my @limit = $self->limit();
+    $args{limit} //= $limit[0];
+    $args{offset} //= $limit[1];
+
     $args{order} = $self->_sort;
 
-    my @ret = $self->SUPER::list( %args );
+    my @ret = $args{admin} ? $self->_list( %args ) : $self->list( %args );
 
     my @list;
     for ( @ret ) {
@@ -293,6 +319,15 @@ sub set_settings {
     return $self->set_json('settings', $new_data );
 }
 
+sub reset_cache {
+    my $self = shift;
+
+    if ( my $cache = $self->cache ) {
+        # Сигнализируем воркерам о необходимости сброса кеша
+        $cache->redis->hset('SHM:Cache:Reset', ref $self, time );
+    }
+}
+
 # Пробуем получить уже загруженные данные
 # Проверяем статус операции и обновляем res
 sub _add_or_set {
@@ -300,8 +335,17 @@ sub _add_or_set {
     my $method = shift;
     my %args = @_;
 
-    if ( $self->can('validate_attributes') ) {
-        return undef unless $self->validate_attributes( $method, %args );
+    # if ( $self->can('validate_attributes') ) {
+    #     unless ( $self->validate_attributes( $method, %args ) ) {
+    #         logger->warning('validate attribute error:', $method, \%args );
+    #         return undef;
+    #     }
+    # }
+
+    if ( $method eq 'add' ) {
+        if ( my $defaults = cfg('defaults')->{ lc $self->kind } ) {
+            %args = %{ hash_merge( $defaults, \%args ) };
+        }
     }
 
     # Преобразуем значения в JSON
@@ -314,7 +358,13 @@ sub _add_or_set {
         }
     }
 
-    my $ret = $method eq 'add' ? $self->SUPER::add( %super_args ) : $self->SUPER::set( %super_args );
+    my $ret;
+    if ( $method eq 'add' ) {
+        $ret = $self->SUPER::add( %super_args )
+    } elsif ( $method eq 'set' ) {
+        $ret = $self->SUPER::set( %super_args );
+        $self->reset_cache();
+    }
 
     if ( defined $ret && %{ $self->res } ) {
         for ( keys %args ) {
@@ -326,8 +376,11 @@ sub _add_or_set {
 
 sub create {
     my $self = shift;
+    my %args = (
+        get_smart_args( @_ ),
+    );
 
-    my $id = $self->_add_or_set('add', get_smart_args(@_) );
+    my $id = $self->add( %args );
     return undef unless $id;
 
     return $self->id( $id );
@@ -377,12 +430,17 @@ sub api_safe_args {
     my %args = @_;
 
     return %args unless $self->can('structure');
-
     my %struct = %{ $self->structure };
 
     for my $key ( keys %args ) {
         unless ( exists $struct{ $key} && $struct{ $key }->{'allow_update_by_user'} ) {
             delete $args{ $key };
+            next;
+        }
+
+        if ( $struct{ $key }->{'hide_for_user'} ) {
+            delete $args{ $key };
+            next;
         }
     }
 
@@ -417,14 +475,19 @@ sub make_event {
     }}
 
     if ( $args{event} && $args{event}->{method} ) {
-        $args{event}->{kind}||= $self->kind;
+        $args{event}->{name} ||= uc $event_name;
+        $args{event}->{kind} ||= $self->kind;
         $event->make( %args );
     }
 
     my @commands = $event->get_events( name => $event_name );
-    for ( @commands ) {
+    for my $e ( @commands ) {
+        my $prio = delete $e->{settings}->{prio};
+        $prio = $args{prio} if $args{prio};
+
         $event->make(
-            event => $_,
+            event => $e,
+            prio => $prio || 100,
             $args{settings} ? ( settings => $args{settings } ) : (),
         );
     }
@@ -436,7 +499,7 @@ sub list_by_settings {
         @_,
     );
 
-    $args{ "settings->$_" } = delete $args{ $_ } for keys %args;
+    $args{ "settings.$_" } = delete $args{ $_ } for keys %args;
 
     return $self->list(
         where => \%args,
@@ -462,8 +525,14 @@ sub report {
         return $self->srv('report');
     }
 
-    state $report ||= get_service('report');
-    return $report;
+    # do not use `state` for fastCGI
+    return get_service('report');
+}
+
+sub cache {
+    my $self = shift;
+    state $cache ||= get_service('Core::System::Cache');
+    return $cache;
 }
 
 sub delete_all {
@@ -491,6 +560,116 @@ sub get_smart_args {
         @args = %{ $args[0] };
     }
     return @args;
+}
+
+sub cloud_headers {
+    my $self = shift;
+
+    return {
+        SHM_INFO_CNT => $self->user->active_count,
+        SHM_INFO_VER => cfg('_shm')->{'version'},
+    }
+}
+
+sub set_user_fail_attempt {
+    my $self = shift;
+    my $method = shift;
+    my $expire = shift || 600;
+    my $additional_ips = shift;
+
+    my $user_ip = get_user_ip() || return undef;
+
+    if ( my @ip_ranges = trusted_ips( $additional_ips ) ) {
+        return 0 if is_ip_allowed($user_ip, \@ip_ranges );
+    }
+
+    my $cache = $self->cache || return undef;
+    my $tag = lc sprintf("%s-%s-%s", ref $self, $method, $user_ip);
+
+    return $cache->increment( $tag, $expire );
+}
+
+sub arch {
+    my $self = shift;
+
+    state $arch ||= `uname -m`;
+    chomp $arch;
+    return $arch;
+}
+
+sub attr {
+    my $self = shift;
+    my $key = shift;
+    my $value = shift;
+
+    if ( defined $value ) {
+        $self->{ $key } = $value;
+    }
+
+    return $self->{ $key };
+}
+
+sub cfg {
+    my $key = shift || return;
+
+    state $config ||= get_service('config');
+    my $obj = $config->id( $key ) || return {};
+
+    my $data = $obj->get_data || {};
+    return wantarray ? %{ $data } : $data;
+}
+
+sub stats_fields {
+    my $self = shift;
+
+    return undef unless $self->can('structure');
+
+    my $structure = $self->structure;
+    my @fields;
+
+    for my $field (sort keys %$structure) {
+        push @fields, $field if $structure->{$field}->{use_for_stats};
+    }
+
+    return @fields;
+}
+
+sub stats {
+    my ($self, $action, $args) = @_;
+
+    my @fields = $self->stats_fields;
+    return unless @fields;
+
+    for my $field (@fields) {
+        my $conf = $self->structure->{$field};
+        my $mode = $conf->{stats_mode};
+
+        next if not defined $args->{$field};
+        if ( $conf->{stats_use_when_add} || $conf->{stats_use_when_set} ) {
+            next unless ( $conf->{stats_use_when_add} && $action eq 'add' )
+                     || ( $conf->{stats_use_when_set} && $action eq 'set' );
+        }
+
+        my $value;
+
+       if ( $mode eq 'inc' ) {
+            $value = 1;
+        } elsif ( $mode eq 'diff' ) {
+            my $method = "get_$field";
+            my $current = $self->$method // 0;
+            $value = $current + 0 - $args->{$field};
+        } else {
+            $value = $args->{$field};
+        }
+
+        $self->srv('statistics')->add(
+            $self->kind,
+            exists $conf->{enum} && exists $args->{$field}
+                ? sprintf("%s:%s", $field, $args->{$field})
+                : $field,
+            $value
+        );
+    }
 }
 
 1;

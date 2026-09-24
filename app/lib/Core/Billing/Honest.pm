@@ -14,6 +14,7 @@ our @EXPORT_OK = qw(
     calc_month_cost
     calc_end_date_by_months
     calc_total_by_date_range
+    calc_period_by_total
 );
 
 use Core::Const;
@@ -26,6 +27,7 @@ use Core::Utils qw(
     parse_period
     days_in_months
     now
+    round
 );
 use Time::Local 'timelocal_nocheck';
 use Time::DaysInMonth;
@@ -64,7 +66,7 @@ sub calc_month_cost {
 
     return {    start => $start_date,
                 stop => $stop_date,
-                total => sprintf("%.2f", $total )
+                total => round( $total )
     };
 }
 
@@ -112,8 +114,11 @@ sub calc_total_by_date_range {
 
         if ( $wd{period} && $wd{period} != 1 ) {
             my ( $months, $days, $hours ) = parse_period( $wd{period} );
-            # TODO: add support days and hours
-            $wd{cost} = $wd{cost} / $months if $months;
+            # Convert per-period cost to per-month cost using seconds.
+            # Works for months-only, days/hours-only, and hybrid (e.g. 1m 2d 3h) periods.
+            my $sec_in_month   = days_in_months( $wd{withdraw_date} ) * 86400;
+            my $sec_per_period = $months * $sec_in_month + $days * 86400 + $hours * 3600;
+            $wd{cost} = $wd{cost} / $sec_per_period * $sec_in_month if $sec_per_period;
         }
 
         # calc first month
@@ -142,7 +147,7 @@ sub calc_total_by_date_range {
     }
 
     return {
-        total => sprintf("%.2f", $total ),
+        total => round( $total ),
         months => calc_months_between_dates(\%start, \%stop),
     };
 }
@@ -169,6 +174,74 @@ sub calc_months_between_dates {
     return sprintf('%d.%02d',
         $delta{year} * 12 + $delta{month},
         $delta{day}),
+}
+
+# Вычисляет период, который можно получить за указанную сумму
+# Возвращает период в формате M.DD (с календарными днями)
+# где M - месяцы, DD - дни (2 цифры, календарные)
+sub calc_period_by_total {
+    my %args = (
+        total => undef,           # Сумма, которую готовы потратить
+        cost => undef,            # Стоимость услуги за период
+        period => 1,              # Период услуги (в месяцах или формате M.DD)
+        reference_date => now(),  # Опорная дата для календарных расчетов
+        @_,
+    );
+
+    return '0.00' unless $args{total} && $args{cost} && $args{cost} > 0;
+
+    my $total = $args{total};
+    my $cost = $args{cost};
+    my $period = $args{period} || 1;
+    my $ref_date = $args{reference_date};
+
+    # Корректируем стоимость если период не равен 1 месяцу
+    my $monthly_cost = $cost;
+    if ( $period && $period != 1 ) {
+        my ( $months, $days, $hours ) = parse_period( $period );
+        # Упрощенная логика: если есть месяцы, делим на количество месяцев
+        $monthly_cost = $cost / $months if $months && $months > 0;
+    }
+
+    # Начинаем с опорной даты
+    my $current_date = $ref_date;
+    my $remaining_total = $total;
+    my $total_months = 0;
+    my $total_days = 0;
+
+    # Стратегия: сначала тратим полные месяцы, потом дни
+    while ($remaining_total >= $monthly_cost) {
+        $remaining_total -= $monthly_cost;
+        $total_months++;
+
+        # Переходим к следующему месяцу для корректного расчета дней
+        my %date_parts = parse_date($current_date);
+        $date_parts{day} = 1;  # Переходим к началу месяца
+        if ($date_parts{month} == 12) {
+            $date_parts{year}++;
+            $date_parts{month} = 1;
+        } else {
+            $date_parts{month}++;
+        }
+        $current_date = sprintf("%d-%.2d-%.2d %.2d:%.2d:%.2d",
+            @date_parts{ qw/year month day hour min sec/ });
+    }
+
+    # Теперь считаем дни из остатка
+    if (defined $remaining_total && $remaining_total > 0) {
+        my $days_in_current_month = days_in_months($current_date);
+        my $cost_per_day = $monthly_cost / $days_in_current_month;
+
+        $total_days = int($remaining_total / $cost_per_day);
+
+        # Если остается еще денег, добавляем один день (округление вверх)
+        if (($remaining_total % $cost_per_day) > 0 && $total_days < $days_in_current_month) {
+            $total_days++;
+        }
+    }
+
+    # Возвращаем период в формате M.DD
+    return sprintf('%d.%02d', $total_months, $total_days);
 }
 
 1;

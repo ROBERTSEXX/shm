@@ -4,6 +4,10 @@ use v5.14;
 use parent 'Core::Base';
 use Core::Base;
 use Core::Const;
+use Core::Billing ();
+use Core::Utils qw(
+    decode_json
+);
 
 sub table { return 'services' };
 
@@ -12,63 +16,101 @@ sub structure {
         service_id => {
             type => 'number',
             key => 1,
+            title => 'id услуги',
         },
         name => {
             type => 'text',
             required => 1,
+            title => 'название услуги',
         },
         cost => {
             type => 'number',
             required => 1,
+            title => 'стоимость',
         },
         period => {
             type => 'number',
             default => 1,
+            title => 'период',
         },
         category => {
             type => 'text',
-            required => 1,
+            default => '%',
+            title => 'категория',
         },
         children => {
             type => 'json',
             value => undef,
+            hide_for_user => 1,
+            title => 'дочерние услуги',
         },
         next => {
             type => 'number',
+            hide_for_user => 1,
+            title => 'id сделующей услуги',
         },
         allow_to_order => {
             type => 'number',
             default => 0,
+            hide_for_user => 1,
+            enum => [0,1],
+            title => 'флаг разрешения регистрации',
         },
         max_count => {
             type => 'number',
+            hide_for_user => 1,
+            title => 'не используется',
         },
         question => {
             type => 'number',
+            hide_for_user => 1,
+            title => 'не используется',
         },
         pay_always => {
             type => 'number',
             default => 0,
+            hide_for_user => 1,
+            title => 'флаг платности',
+            enum => [0,1],
+            description => '1 - платная всегда, даже в качестве дочерней',
         },
         no_discount => {
             type => 'number',
             default => 0,
+            hide_for_user => 1,
+            enum => [0,1],
+            title => 'флаг неприменяемости скидок',
         },
         descr => {
             type => 'text',
+            title => 'описание',
         },
         pay_in_credit => {
             type => 'number',
             default => 0,
+            hide_for_user => 1,
+            enum => [0,1],
+            title => 'флаг разрешения списания в минус',
         },
-        config => { type => 'json', value => undef },
+        config => {
+            type => 'json',
+            value => undef,
+            hide_for_user => 1,
+            title => 'конфиг',
+        },
         is_composite => {
             type => 'number',
             default => 0,
+            hide_for_user => 1,
+            enum => [0,1],
+            title => 'флаг составной услуги',
         },
         deleted => {
             type => 'number',
             default => 0,
+            hide_for_user => 1,
+            enum => [0,1],
+            title => 'флаг удаленной услуги',
         },
     };
 }
@@ -98,9 +140,9 @@ sub children {
         @_,
     );
 
-    if ( my @children = @{$args{ children } || []} ) {
+    if ( defined $args{children} ) {
         my @ret;
-        for ( @children ) {
+        for ( @{ $args{children} } ) {
             next if $_->{service_id} == $self->id;
             push @ret, {
                 service_id => $_->{service_id},
@@ -194,12 +236,17 @@ sub list_for_api {
         @_,
     );
 
+    if ( $args{service_id} && !$args{admin} ) {
+        my $service = $self->id( $args{service_id } ) || return undef;
+        return undef unless $args{admin} || $service->price_list_check_allow_to_order;
+    }
+
     unless ( $args{filter} && $args{filter}->{deleted} ) {
         $args{where} = { deleted => 0 };
     }
 
     if ( $args{admin} && $args{parent} ) {
-        if ( my $service = get_service('service', _id => $args{parent} ) ) {
+        if ( my $service = $self->id( $args{parent} ) ) {
             $args{where} = { service_id => { -in => [ map $_->{service_id}, @{ $service->subservices } ] } };
         }
     }
@@ -213,61 +260,148 @@ sub list_for_api {
     return @arr;
 }
 
+sub price_list_items {
+    my $self = shift;
+    my %args = (
+        service_id => undef,
+        filter => {},
+        @_,
+    );
+
+    my $where = {};
+    my $ids;
+
+    if ( defined $args{service_id} ) {
+        $where = { service_id => $args{service_id} };
+    } elsif ( my $template_id = cfg('billing')->{price_list_template_id} ) {
+        my $template = $self->srv('template', _id => $template_id);
+        unless ($template) {
+            logger->error("Can't get price_list. Template $template_id not found");
+            return ();
+        }
+
+        $ids = decode_json( $template->parse() );
+        unless (ref $ids eq 'ARRAY') {
+            logger->error("Can't get price_list. Template doesn't return array of services ids");
+            return ();
+        }
+        $where = { service_id => { '-in' => $ids } };
+    } else {
+        $where = {
+            %{ $self->query_for_filtering( %{ $args{filter} || {} } ) },
+            $args{category} ? ( category => { -like => $args{category} } ) : (),
+            allow_to_order => 1,
+        };
+    }
+
+    $where->{deleted} = 0;
+    my $items = $self->items( where => $where );
+
+    # Preserve template priority order for service ids from IN list.
+    if ($ids) {
+        my %items_by_id = map { $_->id => $_ } @{ $items || [] };
+        return grep { defined } map { $items_by_id{$_} } @$ids;
+    }
+
+    return @{ $items || [] };
+}
+
+sub price_list_check_allow_to_order {
+    my $self = shift;
+    return grep { $_->{service_id} == $self->id } $self->price_list;
+}
+
 sub price_list {
     my $self = shift;
     my %args = (
+        service_id => undef,
         filter => {},
         get_smart_args(@_),
     );
 
-    my $list = $self->list(
-        where => {
-            %{ $self->query_for_filtering( %{ $args{filter} || {} } ) },
-            $args{category} ? ( category => { -like => $args{category} } ) : (),
-            allow_to_order => 1,
-            deleted => 0,
-        },
-    );
+    my @list;
+    for my $service ( $self->price_list_items( %args ) ) {
+        my $si = $service->id;
+        my $row = $service->get;
+        next if $service->config->{order_only_once} && $service->is_ever_used;
 
-    for my $si ( keys %$list ) {
-        if ( $list->{ $si }->{config}->{order_only_once} ) {
-            my @wd = get_service('wd')->list(
-                where => {
-                    service_id => $si,
-                },
-                limit => 1,
-            );
-            if ( scalar @wd ) {
-                delete $list->{ $si };
-                next;
-            }
-        }
-
-        if ( $list->{ $si }->{is_composite} ) {
-            my $service = $self->id( $si );
-            $list->{ $si }->{cost} = $service->cost_composite();
-        }
-
-        my $cost = $list->{ $si }->{cost};
-        my $discount = $list->{ $si }->{no_discount} ? 0 : $self->user->get_discount;
+        my $cost = $service->is_composite ? $service->cost_composite() : $row->{cost};
+        my $discount = $row->{no_discount} ? 0 : $self->user->get_discount;
         my $cost_discount = $cost * $discount / 100;
+        my $total = $cost - $cost_discount;
 
-        $list->{ $si }->{discount} = $discount;
-        $list->{ $si }->{cost_discount} = $cost_discount;
-        $list->{ $si }->{real_cost} = $cost - $cost_discount;
+        my $bonus = Core::Billing::calc_available_bonuses(
+            $service,
+            $self->user->get_bonus,
+            $total,
+        );
+
+        my $real_cost = $total - $bonus;
+        if ( $real_cost < 0 ) {
+            $bonus += $real_cost;
+            $real_cost = 0;
+        }
+        my $partial_renew = $row->{config}->{allow_partial_period};
+
+        $row->{partial_renew} = $partial_renew;
+        $row->{cost} = $cost;
+        $row->{discount} = $discount;
+        $row->{cost_discount} = $cost_discount;
+        $row->{real_cost} = $cost - $cost_discount;
+        $row->{real_cost_with_bonuses} = $real_cost;
+        $row->{cost_bonus} = $bonus;
+
+        push @list, $row;
     }
 
-    return $list;
+    return @list;
+}
+
+sub us {
+    my $self = shift;
+    return $self->srv('us');
+}
+
+sub wd {
+    my $self = shift;
+    return $self->srv('wd');
+}
+
+sub is_ever_used {
+    my $self = shift;
+
+    my @list = $self->wd->list(
+        where => {
+            service_id => $self->id,
+         },
+        limit => 1,
+    );
+    return scalar @list ? 1 : 0;
+}
+
+sub is_currently_used {
+    my $self = shift;
+
+    my @list = $self->us->list(
+        where => {
+            service_id => $self->id,
+            status => {'!=', STATUS_REMOVED},
+         },
+        limit => 1,
+    );
+    return scalar @list ? 1 : 0;
+}
+
+sub was_previously_used {
+    my $self = shift;
+
+    return 0 if $self->is_currently_used;
+    return $self->is_ever_used;
 }
 
 sub api_price_list {
     my $self = shift;
-
-    my $list = $self->price_list( @_ );
-
-    my @ret;
-    push @ret, $list->{ $_ } for keys %$list;
-    return @ret;
+    return $self->price_list( @_ );
 }
 
 # legacy: for backward compatible
@@ -292,8 +426,14 @@ sub categories {
 
 sub settings {
     my $self = shift;
-
     return $self->config || {};
 }
+
+sub config {
+    my $self = shift;
+    return $self->get_config || {};
+}
+
+sub no_auto_renew { shift->config->{no_auto_renew} || 0 };
 
 1;

@@ -18,19 +18,26 @@ sub structure {
         user_id => {
             type => 'number',
             auto_fill => 1,
+            key_mul => 1,
+            title => 'id пользователя',
         },
         name => {
             type => 'text',
             key => 1,
+            title => 'имя ключа',
         },
         created => {
             type => 'text',
+            title => 'дата создания',
+            readOnly => 1,
         },
         user_service_id => {
             type => 'number',
+            title => 'id услуги пользователя',
         },
         data => {
             type => 'text',
+            title => 'данные',
         },
         settings => { type => 'json', value => {} },
     }
@@ -66,8 +73,15 @@ sub _add_or_replace {
     } else {
         $data = delete $args{ PUTDATA } || delete $args{ POSTDATA };
         if ( $ENV{CONTENT_TYPE} =~/application\/json/i ) {
-            $args{settings}->{json} = 1;
+            if ( decode_json( $data ) ) {
+                $args{settings}->{json} = 1;
+            }
         }
+    }
+
+    unless ( $args{name} ) {
+        get_service('report')->add_error("Name is required");
+        return undef;
     }
 
     if ( $method eq 'add' ) {
@@ -81,6 +95,7 @@ sub _add_or_replace {
             return undef;
         }
     } elsif ( $method eq 'set' ) {
+        $self = $self->id( $args{name} ) || return undef;
         $self->_set(
             data => $data,
             where => {
@@ -89,6 +104,8 @@ sub _add_or_replace {
             },
         );
     }
+
+    $self->{res}->{data} = $args{data};
 
     return {
         result => 'successful',
@@ -167,23 +184,40 @@ sub read {
         @_,
     );
 
-    my ( $data ) = $self->SUPER::list(
-        where => {
-            name => $args{name},
-        },
+    my $self = $self->id( $args{name} );
+    return undef unless $self;
+
+    return $self->data( decode_json => $args{decode_json} );
+}
+
+sub get {
+    my $self = shift;
+    my %args = @_;
+
+    $self->SUPER::get( %args ) || return '';
+    $self->data(); # convert data to json if json
+
+    return wantarray ? %{ $self->{res} } : $self->{res};
+}
+
+sub data {
+    my $self = shift;
+    my %args = (
+        decode_json => 1,
+        @_,
     );
 
-    return undef unless $data;
-
-    if ( $args{decode_json} && $data->{settings}->{json} ) {
-        my $json = decode_json( $data->{data} );
-        $json //= decode_json( $data->{data} );
-        $data->{data} = $json;
+   if ( $args{decode_json} && $self->get_settings->{json} ) {
+        my $data = $self->get_data;
+        unless ( ref $data ) {
+            if ( my $json = decode_json( $data ) ) {
+                $self->{res}->{data} = $json;
+            }
+        }
     } else {
-        utf8::decode( $data->{data} );
+        utf8::decode( $self->{res}->{data} );
     }
-
-    return $data->{data};
+    return $self->get_data;
 }
 
 sub download {

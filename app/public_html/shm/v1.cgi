@@ -10,15 +10,46 @@ use Core::Utils qw(
     parse_args
     encode_json
     decode_json
+    is_email
     switch_user
+    blessed
+    print_header
+    print_json
+    get_user_ip
+    qrencode
 );
 
 use CGI::Carp qw(fatalsToBrowser);
 use Data::Dumper;
+use Time::HiRes ();
 
-my $routes = {
+sub route_methods {
+    my @pairs;
+    while (@_) {
+        my $key   = shift;
+        my $value = shift;
+        if (ref $key eq 'ARRAY') {
+            push @pairs, $_, $value for @$key;
+        }
+        else {
+            push @pairs, $key, $value;
+        }
+    }
+    return @pairs;
+}
+
+state $routes //= {
+'/healthcheck' => {
+    GET => {
+        params => {},
+        controller => 'Test',
+        method => 'healthcheck',
+        skip_check_auth => 1,
+    },
+},
 '/test' => {
     GET => {
+        params => {},
         controller => 'Test',
         skip_check_auth => 1,
     },
@@ -29,283 +60,951 @@ my $routes = {
         method => 'http_echo',
         skip_check_auth => 1,
     },
+    PUT => {
+        controller => 'Test',
+        method => 'http_echo',
+        skip_check_auth => 1,
+    },
     POST => {
         controller => 'Test',
         method => 'http_echo',
         skip_check_auth => 1,
     },
+    DELETE => {
+        controller => 'Test',
+        method => 'http_echo',
+        skip_check_auth => 1,
+    },
+},
+'/company' => {
+    GET => {
+        params => {},
+        controller => 'Config',
+        method => 'api_data_by_company',
+        skip_check_auth => 1,
+    },
+},
+'/system/auth' => {
+    swagger => {
+        tags => 'Авторизация',
+    },
+    GET => {
+        params => {},
+        skip_check_auth => 1,
+        controller => 'Config',
+        method => 'api_data_by_auth',
+        swagger => {
+            summary => 'Доступные способы входа (OAuth2-провайдеры, Telegram) и разрешения на регистрацию/вход/капчу через API',
+        },
+    },
+},
+'/user/captcha' => {
+    swagger => { tags => 'Капча' },
+    GET => {
+        params => {},
+        controller      => 'User',
+        method          => 'gen_captcha',
+        skip_check_auth => 1,
+        swagger => { summary => 'Получение капчи' },
+    },
 },
 '/user' => {
+    swagger => { tags => 'Пользователи' },
     GET => {
         controller => 'User',
+        method => 'list_for_api', # hide COMMON_LIST_PARAMS
+        swagger => { summary => 'Получение пользователя' },
+        params => {},
     },
     PUT => {
         controller => 'User',
-        method => 'reg',
+        method => 'reg_api_safe',
         skip_check_auth => 1,
-        required => ['login','password'],
+        params => {
+            login => { type => 'string', required => 1, min_length => 1, max_length => 64 },
+            login_type => { type => 'string', required => 0, enum => ['login','email'] },
+            password => { type => 'string', required => 1, min_length => 10, max_length => 128 },
+            full_name => { type => 'string', required => 0, min_length => 1, max_length => 64 },
+            phone => { type => 'string', required => 0, min_length => 1, max_length => 16 },
+            partner_id => { type => 'integer', min => 2 },
+            captcha_token  => { type => 'string' },
+            captcha_answer => { type => 'string' },
+        },
+        swagger => { summary => 'Регистрация пользователя' },
     },
+},
+'/user/referrals' => {
+    swagger => { tags => 'Пользователи' },
+    GET => {
+        params => {},
+        controller => 'User',
+        method => 'api_referrals',
+            swagger => { summary => 'Получение количества рефералов' },
+    },
+},
+'/user/auth' => {
+    swagger => { tags => 'Пользователи' },
     POST => {
         controller => 'User',
+        method => 'auth_api_safe',
+        skip_check_auth => 1,
+        params => {
+            login    => { type => 'string', required => 1, min_length => 1, max_length => 64 },
+            password => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+            otp_token => { type => 'string', required => 0, min_length => 1, max_length => 128 },
+        },
+        args => {
+            format => 'json',
+        },
+        swagger => {
+            summary => 'Авторизация (получение `session_id`)',
+            responses => {
+                '200' => {
+                    content => {
+                        'application/json' => {
+                            schema => {
+                                type => 'object',
+                                properties => {
+                                    id => {
+                                        type => 'string'
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+},
+'/user/password-auth' => {
+    swagger => { tags => 'Пользователи' },
+    GET => {
+        params => {},
+        controller => 'User',
+        method => 'api_password_auth_status',
+        swagger => { summary => 'Статус входа по паролю' },
+    },
+    POST => {
+        params => {},
+        controller => 'User',
+        method => 'api_enable_password_auth',
+        swagger => { summary => 'Включение входа по паролю' },
+    },
+    DELETE => {
+        params => {},
+        controller => 'User',
+        method => 'api_disable_password_auth',
+        swagger => { summary => 'Отключение входа по паролю' },
+    },
+},
+'/user/otp' => {
+    swagger => { tags => 'OTP' },
+    GET => {
+        params => {},
+        controller => 'User::OTP',
+        method => 'api_status',
+        swagger => { summary => 'Статус OTP' },
+    },
+    POST => {
+        params => {
+            token => { type => 'string', required => 1, min_length => 1, max_length => 16 },
+        },
+        controller => 'User::OTP',
+        method => 'api_verify',
+        swagger => { summary => 'Проверка OTP' },
+    },
+    PUT => {
+        params => {
+            token => { type => 'string', required => 1, min_length => 1, max_length => 16 },
+        },
+        controller => 'User::OTP',
+        method => 'api_enable',
+        swagger => { summary => 'Включение OTP' },
+    },
+    DELETE => {
+        params => {
+            token => { type => 'string', required => 1, min_length => 1, max_length => 16 },
+        },
+        controller => 'User::OTP',
+        method => 'api_disable',
+        swagger => { summary => 'Отключение OTP' },
+    },
+},
+'/user/otp/setup' => {
+    swagger => { tags => 'OTP' },
+    POST => {
+        params => {},
+        controller => 'User::OTP',
+        method => 'api_setup',
+        swagger => {
+            summary => 'Настройка OTP',
+            responses => {
+                '200' => {
+                    content => {
+                        'application/json' => {
+                            schema => {
+                                type => 'object',
+                                properties => {
+                                    qr_url => {
+                                        type => 'string'
+                                    },
+                                    secret => {
+                                        type => 'string'
+                                    },
+                                    backup_codes => {
+                                        type => 'array',
+                                        items => {
+                                            type => 'number'
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+},
+'/user/passkey/register' => {
+    swagger => { tags => 'Passkey Регистрация' },
+    GET => {
+        params => {},
+        controller => 'User::Passkey',
+        method => 'api_register_options',
+        swagger => { summary => 'Получение параметров регистрации Passkey' },
+    },
+    POST => {
+        params => {
+            credential_id => { type => 'string', required => 1, min_length => 1, max_length => 512 },
+            response      => { type => 'string', required => 1, min_length => 1, max_length => 8192 },
+        },
+        controller => 'User::Passkey',
+        method => 'api_register_complete',
+        swagger => { summary => 'Завершение регистрации Passkey' },
+    },
+},
+'/user/passkey' => {
+    swagger => { tags => 'Passkey Настройки' },
+    GET => {
+        params => {},
+        controller => 'User::Passkey',
+        method => 'api_list',
+        swagger => { summary => 'Список зарегистрированных Passkey' },
+    },
+    POST => {
+        params => {
+            credential_id => { type => 'string', required => 1, min_length => 1, max_length => 512 },
+            name          => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+        },
+        controller => 'User::Passkey',
+        method => 'api_rename',
+        swagger => { summary => 'Переименование зарегистрированного Passkey по идентификатору' },
+    },
+    DELETE => {
+        params => {
+            credential_id => { type => 'string', required => 1, min_length => 1, max_length => 512 },
+        },
+        controller => 'User::Passkey',
+        method => 'api_delete',
+        swagger => { summary => 'Удаление зарегистрированного Passkey по идентификатору' },
+    },
+},
+'/user/auth/passkey' => {
+    swagger => { tags => 'Passkey Аутентификация' },
+    GET => {
+        params => {},
+        controller => 'User::Passkey',
+        method => 'api_auth_options_public',
+        skip_check_auth => 1,
+        swagger => { summary => 'Получение параметров публичной аутентификации Passkey' },
+    },
+    POST => {
+        params => {
+            credential_id => { type => 'string', required => 1, min_length => 1, max_length => 512 },
+            response      => { type => 'string', required => 1, min_length => 1, max_length => 8192 },
+        },
+        controller => 'User::Passkey',
+        method => 'api_auth_public',
+        skip_check_auth => 1,
+        swagger => { summary => 'Аутентификация пользователя с помощью Passkey' },
     },
 },
 '/user/passwd' => {
+    swagger => { tags => 'Пользователи' },
     POST => {
+        swagger => { summary => 'Смена пароля пользователя' },
         controller => 'User',
         method => 'passwd',
-        required => ['password'],
+        params => {
+            password     => { type => 'string', required => 1, min_length => 6, max_length => 128 },
+            old_password => { type => 'string', min_length => 1, max_length => 128 },
+            login        => { type => 'string', min_length => 1, max_length => 128 },
+        },
     },
 },
 '/user/passwd/reset' => {
+    swagger => { tags => 'Пользователи' },
     POST => {
+        params => {
+            login => { type => 'string', min_length => 1, max_length => 64 },
+            email => { type => 'email', max_length => 254 },
+        },
         controller => 'User',
         method => 'passwd_reset_request',
         skip_check_auth => 1,
-        required => ['email'],
+        swagger => { summary => 'Запрос на сброс пароля пользователя' },
+    },
+},
+'/user/passwd/reset/verify' => {
+    swagger => { tags => 'Пользователи' },
+    GET => {
+        controller => 'User',
+        method => 'passwd_reset_verify',
+        skip_check_auth => 1,
+        params => {
+            token => { type => 'string', required => 1, min_length => 8, max_length => 256 },
+            login => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+        },
+        swagger => { summary => 'Проверка токена сброса пароля пользователя перед сменой пароля' },
+    },
+    POST => {
+        controller => 'User',
+        method => 'passwd_reset_verify',
+        skip_check_auth => 1,
+        params => {
+            password => { type => 'string', required => 1, min_length => 6, max_length => 128 },
+            token    => { type => 'string', required => 1, min_length => 8, max_length => 256 },
+            login    => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+        },
+        swagger => { summary => 'Смена пароля пользователя по токену сброса' },
+    },
+},
+'/user/accounts' => {
+    swagger => { tags => 'Пользователи' },
+    GET => {
+        controller => 'User::Logins',
+        swagger    => { summary => 'Список аккаунтов пользователя' },
+    },
+    DELETE => {
+        params => {
+            login => { type => "string", min_length => 1, max_length => 128 },
+        },
+        controller => 'User::Logins',
+    },
+},
+'/user/email' => {
+    swagger => { tags => 'Пользователи' },
+    PUT => {
+        controller => 'User',
+        method => 'set_email',
+        params => {
+            email => { type => 'email', required => 1, max_length => 254 },
+        },
+        swagger => { summary => 'Привязка email пользователя' },
+    },
+    GET => {
+        params => {},
+        controller => 'User',
+        method => 'get_emails',
+        swagger => { summary => 'Получение email пользователя' },
+    },
+    POST => {
+        params => {
+            email => { type => 'email', required => 1, max_length => 254 },
+            code  => { type => 'string', min_length => 1, max_length => 16 },
+        },
+        controller => 'User',
+        method => 'verify_email',
+        swagger => { summary => 'Верификация email пользователя' },
+    },
+    DELETE => {
+        params => {
+            email => { type => 'email', required => 1, max_length => 254 },
+        },
+        controller => 'User',
+        method => 'delete_email',
+        swagger => { summary => 'Удаление email пользователя' },
     },
 },
 '/user/service' => {
+    swagger => { tags => 'Услуги пользователей' },
     GET => {
-        controller => 'UserService',
+        controller => 'USObject',
+        params => {
+            user_service_id => { type => 'integer', min => 1 },
+        },
+        swagger => { summary => 'Список услуг пользователя' },
     },
     DELETE => {
         controller => 'USObject',
-        required => ['user_service_id'],
+        params => {
+            user_service_id => { type => 'integer', required => 1, min => 1 },
+        },
+        swagger => { summary => 'Удаление услуги пользователя' },
+    },
+    POST => {
+        controller => 'USObject',
+        method => 'api_add_description',
+        params => {
+            user_service_id => { type => 'integer', required => 1, min => 1 },
+            description     => { type => 'string', required => 1, max_length => 254 },
+        },
+        swagger => { summary => 'Изменить заметку пользователя об услуге' },
     },
 },
 '/user/service/stop' => {
+    swagger => { tags => 'Услуги пользователей' },
     POST => {
         controller => 'USObject',
-        method => 'block',
-        required => ['user_service_id'],
+        method => 'block_force',
+        params => {
+            user_service_id => { type => 'integer', required => 1, min => 1 },
+        },
+        swagger => { summary => 'Остановка услуги пользователя' },
+    },
+},
+'/user/service/change' => {
+    swagger => { tags => 'Услуги пользователей' },
+    POST => {
+        controller => 'USObject',
+        method => 'change',
+        params => {
+            user_service_id => { type => 'integer', required => 1, min => 1 },
+            service_id      => { type => 'integer', required => 1, min => 1 },
+            finish_active   => { type => 'boolean' },
+        },
+        swagger => { summary => 'Смена тарифа' },
     },
 },
 '/user/withdraw' => {
+    swagger => { tags => 'Пользователи' },
     GET => {
         controller => 'Withdraw',
+        swagger => { summary => 'Списания средств' },
     },
 },
 '/user/autopayment' => {
+    swagger => { tags => 'Пользователи' },
+    GET => {
+        params => {},
+        controller => 'User',
+        method => 'list_autopayments',
+        swagger => { summary => 'Список автоплатежей пользователя' },
+    },
     DELETE => {
         controller => 'User',
         method => 'delete_autopayment',
+        params => {
+            pay_system => { type => 'string', max_length => 64 },
+        },
+        args => {
+            format => 'json',
+        },
+        swagger => { summary => 'Удаление автоплатежей пользователя' },
     },
 },
 '/user/pay' => {
+    swagger => { tags => 'Платежи' },
     GET => {
         controller => 'Pay',
+        swagger => { summary => 'Список платежей пользователя' },
     },
 },
 '/user/pay/forecast' => {
+    swagger => { tags => 'Платежи' },
     GET => {
+        params => {
+            days           => { type => 'integer', min => 1, max => 90 },
+            consider_today => { type => 'boolean' },
+            blocked        => { type => 'boolean' },
+        },
         controller => 'Pay',
         method => 'forecast',
+        swagger => { summary => 'Прогноз оплаты' },
     },
 },
 '/user/pay/paysystems' => {
+    swagger => { tags => 'Платежи' },
     GET => {
+        params => {
+            amount    => { type => 'number', min => 0 },
+            paysystem => { type => 'string', max_length => 64 },
+            pp        => { type => 'boolean' },
+        },
         controller => 'Pay',
-        method => 'paysystems',
+        method => 'api_paysystems',
+        swagger => { summary => 'Платежные системы' },
     },
 },
 '/service/order' => {
+    swagger => { tags => 'Услуги' },
     GET => {
+        params => {},
         controller => 'Service',
         method => 'api_price_list',
+        swagger => { summary => 'Список услуг для заказа' },
     },
     PUT => {
         controller => 'USObject',
         method => 'create_for_api_safe',
-        required => ['service_id'],
+        params => {
+            service_id => { type => 'integer', required => 1, min => 1 },
+        },
+        swagger => { summary => 'Регистрация услуги' },
     },
 },
 '/service' => {
+    swagger => { tags => 'Услуги' },
     GET => {
+        swagger => { summary => 'Информация об услуге' },
         controller => 'Service',
-        method => 'list_for_api',
-        required => ['service_id'],
+        params => {
+            service_id => { type => 'integer', required => 1, min => 1 },
+        },
     },
 },
 '/template/*' => {
+    swagger => { tags => 'Шаблоны' },
+    splat_to => 'id',
+    route_methods(
     GET => {
+        params => {
+            dry_run => { type => 'boolean' },
+            usi => { type => 'integer', min => 1 },
+            format => { type => 'string', enum => ['default','plain','html','json','other','qrcode','qrcode_png'] },
+        },
         controller => 'Template',
-        method => 'show',
-        required => ['splat'],
+        method => 'parse_for_api',
         args => {
             format => 'plain',
         },
+        swagger => { summary => 'Выполнение шаблона' },
     },
-    POST => {
+        ['PUT','POST','DELETE'] => {
+        params => {},
         controller => 'Template',
-        method => 'show',
-        required => ['splat'],
+        method => 'parse_for_api',
+        skip_auto_parse_json => 1,
         args => {
             format => 'plain',
         },
+        swagger => { summary => 'Выполнение шаблона с аргументами' },
     },
+    ),
 },
 '/public/*' => {
+    swagger => { tags => 'Шаблоны' },
+    splat_to => 'id',
+    route_methods(
     GET => {
+        params => {
+            format => { type => 'string', enum => ['default','plain','html','json','other','qrcode','qrcode_png'] },
+        },
         user_id => 1,
         controller => 'Template',
-        method => 'show_public',
-        required => ['splat'],
-        args => {
-            format => 'plain',
-        },
+        method => 'parse_for_public',
+            args => {
+                format => 'plain',
+            },
+        swagger => { summary => 'Выполнение публичного шаблона' },
     },
-    POST => {
+        ['PUT','POST','DELETE'] => {
+        params => {},
         user_id => 1,
         controller => 'Template',
-        method => 'show_public',
-        required => ['splat'],
-        args => {
-            format => 'plain',
-        },
+        method => 'parse_for_public',
+        skip_auto_parse_json => 1,
+            args => {
+                format => 'plain',
+            },
+        swagger => { summary => 'Выполнение публичного шаблона с аргументами' },
     },
+    ),
 },
+# метод для случаев, когда нужно сохранить ещё и settings
 '/storage/manage' => {
+    swagger => { tags => 'Хранилище' },
     GET => {
+        params => {},
         controller => 'Storage',
+        swagger => { summary => 'Список данных' },
     },
-    PUT => {
+    PUT => { #TODO
+        params => {},
         controller => 'Storage',
+        swagger => { summary => 'Создание данных в хранилище' },
     },
-    POST => {
+    POST => { #TODO
+        params => {},
         controller => 'Storage',
+        swagger => { summary => 'Изменение данных в хранилище' },
     },
-    DELETE => {
+    DELETE => { #TODO
+        params => {},
         controller => 'Storage',
+        swagger => { summary => 'Удаление данных из хранилища' },
     },
 },
-'/storage/manage/:name' => {
+'/storage/manage/*' => {
+    swagger => { tags => 'Хранилище' },
+    splat_to => 'name',
     GET => {
+        params => {},
         controller => 'Storage',
         method => 'read',
-        required => ['name'],
         args => {
             format => 'plain',
         },
+        swagger => { summary => 'Чтение данных из хранилища' },
     },
     PUT => {
+        params => {},
         controller => 'Storage',
         method => 'add',
-        required => ['name','PUTDATA'],
         skip_auto_parse_json => 1,
-    },
-    POST => {
-        controller => 'Storage',
-        method => 'replace',
-        required => ['name','POSTDATA'],
-        skip_auto_parse_json => 1,
-    },
-    DELETE => {
-        controller => 'Storage',
-        method => 'delete',
-        required => ['name'],
-    },
-},
-'/storage/download/:name' => {
-    GET => {
-        controller => 'Storage',
-        method => 'download',
-        required => ['name'],
+        allow_text_plain => 1,
         args => {
             format => 'plain',
         },
+        swagger => { summary => 'Создание данных в хранилище' },
+    },
+    POST => {
+        params => {},
+        controller => 'Storage',
+        method => 'replace',
+        skip_auto_parse_json => 1,
+        allow_text_plain => 1,
+        args => {
+            format => 'plain',
+        },
+        swagger => { summary => 'Изменение данных в хранилище' },
+    },
+    DELETE => {
+        params => {},
+        controller => 'Storage',
+        method => 'delete',
+        swagger => { summary => 'Удаление данных из хранилища' },
     },
 },
-
-'/admin/service' => {
+'/storage/download/*' => {
+    swagger => { tags => 'Хранилище' },
+    splat_to => 'name',
     GET => {
+        params => {},
+        controller => 'Storage',
+        method => 'download',
+        args => {
+            format => 'plain',
+        },
+        swagger => { summary => 'Скачивание данных из хранилища' },
+    },
+},
+'/promo' => {
+    swagger => { tags => 'Промокоды' },
+    GET => {
+        params => {},
+        controller => 'Promo',
+        method => 'api_get',
+        swagger => {
+            summary => 'Список промокодов пользователя',
+            responses => {
+                '200' => {
+                    content => {
+                        'application/json' => {
+                            schema => {
+                                type => 'object',
+                                properties => {
+                                    promo_code => {
+                                        type => 'string',
+                                    },
+                                    created => {
+                                        type => 'string',
+                                        format => 'date-time',
+                                    },
+                                    expire => {
+                                        type => 'string',
+                                        format => 'date-time',
+                                    },
+                                    reusable => {
+                                        type => 'integer',
+                                        enum => [0, 1],
+                                    },
+                                    status => {
+                                        type => 'integer',
+                                        enum => [0, 1],
+                                    },
+                                    used => {
+                                        type => 'integer',
+                                        enum => [0, 1],
+                                        description => 'Использован ли промокод (только для одноразовых, для reusable всегда 0)',
+                                    },
+                                    used_date => {
+                                        type => 'string',
+                                        format => 'date-time',
+                                        description => 'Дата использования промокода',
+                                    },
+                                    used_by => {
+                                        type => 'integer',
+                                        description => 'ID пользователя, использовавшего промокод',
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+},
+'/promo/apply/*' => {
+    swagger => { tags => 'Промокоды' },
+    splat_to => 'code',
+    GET => {
+        params => {},
+        controller => 'Promo',
+        method => 'api_apply',
+        args => {
+            format => 'json',
+        },
+        swagger => { summary => 'Применение промокода' },
+    },
+},
+'/admin/system/version' => {
+    GET => {
+        params => {},
+        controller => 'Config',
+        method => 'version_info',
+        args => {
+            format => 'json',
+        },
+    },
+},
+'/admin/service' => {
+    swagger => { tags => 'Услуги' },
+    GET => {
+        params => {
+            service_id => { type => 'integer', min => 1 },
+        },
         controller => 'Service',
+        swagger => { summary => 'Получение услуги' },
     },
     PUT => {
         controller => 'Service',
+        swagger => { summary => 'Создание услуги' },
     },
     POST => {
         controller => 'Service',
-        required => ['service_id'],
+        swagger => { summary => 'Изменение услуги' },
     },
     DELETE => {
+        params => {
+            service_id => { type => 'integer', required => 1, min => 1 },
+        },
         controller => 'Service',
-        required => ['service_id'],
+        swagger => { summary => 'Удаление услуги' },
     },
 },
 '/admin/service/order' => {
+    swagger => { tags => ['Услуги','Услуги пользователей'] },
     GET => {
+        params => {},
         controller => 'Service',
         method => 'api_price_list',
+        swagger => { summary => 'Список услуг доступных для регистрации' },
     },
     PUT => {
+        params => {
+            user_id    => { type => 'integer', required => 1, min => 1 },
+            service_id => { type => 'integer', required => 1, min => 1 },
+            months     => { type => 'number', min => 0.001 },
+            cost       => { type => 'number', min => 0 },
+            settings   => { type => 'object' },
+        },
         controller => 'USObject',
         method => 'create_for_api',
-        required => ['service_id'],
+        swagger => { summary => 'Регистрация услуги пользователю' },
     },
 },
 '/admin/service/children' => {
+    swagger => { tags => 'Услуги' },
     GET => {
+        params => {
+            service_id => { type => 'integer', required => 1, min => 1 },
+        },
         controller => 'Service',
         method => 'api_subservices_list',
-        required => ['service_id'],
+        swagger => { summary => 'Список дочерних услуг' },
     },
     POST => {
+        params => {
+            service_id => { type => 'integer', required => 1, min => 1 },
+            children   => { type => 'object', required => 1 },
+        },
         controller => 'Service',
         method => 'children',
-        required => ['service_id', 'children'],
+        swagger => { summary => 'Изменение списка дочерних услуг' },
     },
 },
-
 '/admin/service/event' => {
+    swagger => { tags => 'События' },
     GET => {
         controller => 'Events',
+        swagger => { summary => 'Список событий' },
     },
     PUT => {
         controller => 'Events',
+        swagger => { summary => 'Создание события' },
     },
     POST => {
         controller => 'Events',
+        swagger => { summary => 'Изменение события' },
     },
     DELETE => {
+        params => {
+            id => { type => 'integer', required => 1, min => 1 },
+        },
         controller => 'Events',
+        swagger => { summary => 'Удаление события' },
     },
 },
-
-
 '/admin/user' => {
+    swagger => { tags => 'Пользователи' },
     GET => {
         controller => 'User',
-        method => 'list_for_api',
+        swagger => { summary => 'Список клиентов' },
     },
     PUT => {
         controller => 'User',
-        required => ['login','password'],
+        method => 'reg',
+        swagger => { summary => 'Создание клиента' },
     },
     POST => {
         controller => 'User',
-        required => ['user_id'],
+        swagger => { summary => 'Изменение клиента' },
     },
     DELETE => {
         controller => 'User',
-        required => ['user_id'],
+        params => {
+            user_id => { type => 'integer', required => 1, min => 1 },
+            force => { type => 'boolean' },
+        },
+        swagger => { summary => 'Удаление клиента' },
+    },
+},
+'/admin/user/group' => {
+    swagger => { tags => 'Группы пользователей' },
+    GET => {
+        params => {
+            gid  => { type => 'integer', min => 1 },
+        },
+        controller => 'User::Groups',
+        swagger => { summary => 'Получение списка групп пользователей' },
+    },
+    PUT => {
+        controller => 'User::Groups',
+        params => {
+            name           => { type => 'string', required => 1, min_length => 1, max_length => 255 },
+            is_admin       => { type => 'boolean' },
+            default_policy => { type => 'string', enum => ['allow','deny'] },
+            rules          => { type => 'array' },
+        },
+        swagger => { summary => 'Создание группы пользователей' },
+    },
+    POST => {
+        controller => 'User::Groups',
+        params => {
+            gid            => { type => 'integer', required => 1, min => 1 },
+            name           => { type => 'string', min_length => 1, max_length => 255 },
+            is_admin       => { type => 'boolean' },
+            default_policy => { type => 'string', enum => ['allow','deny'] },
+            rules          => { type => 'array' },
+        },
+        swagger => { summary => 'Изменение группы пользователей' },
+    },
+    DELETE => {
+        params => {
+            gid => { type => 'integer', required => 1, min => 1 },
+        },
+        controller => 'User::Groups',
+        swagger => { summary => 'Удаление группы пользователей' },
+    },
+},
+'/admin/user/search' => {
+    swagger => { tags => 'Пользователи' },
+    GET => {
+        params => {
+            text => { type => 'string', min_length => 1, max_length => 128 },
+        },
+        controller => 'User',
+        method => 'api_search_for_admins',
+        swagger => { summary => 'Поиск клиентов' },
+    },
+},
+'/admin/user/accounts' => {
+    swagger => { tags => 'Пользователи' },
+    GET => {
+        controller => 'User::Logins',
+        swagger    => { summary => 'Список аккаунтов' },
+    },
+    PUT => {
+        controller => 'User::Logins',
+        swagger    => { summary => 'Добавление аккаунта' },
+    },
+    POST => {
+        params => {
+            login   => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+            type    => { type => 'string', required => 1, min_length => 1, max_length => 32 },
+            user_id => { type => 'integer', required => 1, min => 1 },
+            password => { type => 'string', min_length => 8, max_length => 64 },
+            settings => { type => 'object' },
+            primary => { type => 'boolean' },
+        },
+        controller => 'User::Logins',
+        swagger    => { summary => 'Изменение аккаунта' },
+    },
+    DELETE => {
+        params => {
+            user_id => { type => 'integer', required => 1, min => 1 },
+            login   => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+            type    => { type => 'string', required => 1, min_length => 1, max_length => 32 },
+        },
+        controller => 'User::Logins',
+        method     => 'api_delete',
+        swagger    => { summary => 'Удаление аккаунта' },
     },
 },
 '/admin/user/passwd' => {
+    swagger => { tags => 'Пользователи' },
     POST => {
         controller => 'User',
         method => 'passwd',
-        required => ['user_id','password'],
+        params => {
+            user_id  => { type => 'integer', required => 1, min => 1 },
+            password => { type => 'string',  required => 1, min_length => 6, max_length => 128 },
+            login    => { type => 'string', min_length => 1, max_length => 128 },
+        },
+        swagger => { summary => 'Смена пароля клиенту' },
     },
 },
 '/admin/user/payment' => {
+    swagger => { tags => 'Пользователи' },
     PUT => {
         controller => 'User',
         method => 'payment',
-        required => ['user_id','money'],
+        params => {
+            user_id => { type => 'integer', required => 1, min => 1 },
+            money   => { type => 'number',  required => 1 },
+            pay_system_id => { type => 'string' },
+            comment => { type => 'object' },
+        },
+        swagger => { summary => 'Зачисление денег клиенту' },
     },
 },
 '/admin/user/profile' => {
     GET => {
+        params => {},
         controller => 'Profile',
     },
     PUT => {
@@ -315,242 +1014,581 @@ my $routes = {
         controller => 'Profile',
     },
     DELETE => {
+        params => {
+            user_id => { type => 'integer', required => 1, min => 1 },
+            id      => { type => 'integer', required => 1, min => 1 },
+        },
         controller => 'Profile',
     },
 },
 '/admin/user/pay' => {
+    swagger => { tags => 'Платежи' },
     GET => {
         controller => 'Pay',
+        swagger => { summary => 'Список платежей клиентов' },
     },
-    PUT => {
+    DELETE => {
+        params => {
+            user_id => { type => 'integer', required => 1, min => 1 },
+            id      => { type => 'integer', required => 1, min => 1 },
+        },
         controller => 'Pay',
+        swagger => { summary => 'Удаление платежа клиента' },
     },
 },
 '/admin/user/bonus' => {
+    swagger => { tags => 'Бонусы' },
     GET => {
         controller => 'Bonus',
+        swagger => { summary => 'Список бонусов клиентов' },
     },
     PUT => {
         controller => 'Bonus',
+        swagger => { summary => 'Создание бонуса' },
+    },
+    POST => {
+        controller => 'Bonus',
+        swagger => { summary => 'Изменение бонуса' },
+    },
+    DELETE => {
+        params => {
+            id      => { type => 'integer', required => 1, min => 1 },
+            user_id => { type => 'integer', required => 1, min => 1 },
+        },
+        controller => 'Bonus',
+        swagger => { summary => 'Удаление бонуса' },
     },
 },
 '/admin/user/service' => {
+    swagger => { tags => 'Услуги пользователей' },
     GET => {
+        params => {
+            user_id         => { type => 'integer', min => 1 },
+            parent          => { type => 'integer', min => 1 },
+            service_id      => { type => 'integer', min => 1 },
+            user_service_id => { type => 'integer', min => 1 },
+        },
         controller => 'UserService',
+        swagger => { summary => 'Список услуг клиентов' },
     },
     PUT => {
         controller => 'USObject',
     },
     POST => {
         controller => 'USObject',
-        required => ['user_id', 'user_service_id'],
+        swagger => { summary => 'Изменение услуги клиента' },
     },
     DELETE => {
+        params => {
+            user_id         => { type => 'integer', required => 1, min => 1 },
+            user_service_id => { type => 'integer', required => 1, min => 1 },
+        },
         controller => 'USObject',
-        required => ['user_id', 'user_service_id'],
+        swagger => { summary => 'Удаление услуги клиента' },
     },
 },
 '/admin/user/service/categories' => {
+    swagger => { tags => 'Услуги пользователей' },
     GET => {
+        params => {},
         controller => 'Service',
         method => 'categories',
+        swagger => { summary => 'Получение списка категорий услуг' },
     },
 },
 '/admin/user/service/withdraw' => {
+    swagger => { tags => 'Списания' },
     GET => {
+        params => {
+            user_id     => { type => 'integer', min => 1 },
+            withdraw_id => { type => 'integer', min => 1 },
+        },
         controller => 'Withdraw',
+        swagger => { summary => 'Получение списка списаний клиентов' },
     },
     PUT => {
         controller => 'Withdraw',
+        swagger => { summary => 'Создание списания клиенту' },
     },
     POST => {
         controller => 'Withdraw',
-        required => ['user_id', 'withdraw_id'],
+        swagger => { summary => 'Изменение списания клиента' },
+    },
+    DELETE => {
+        params => {
+            user_id     => { type => 'integer', required => 1, min => 1 },
+            withdraw_id => { type => 'integer', required => 1, min => 1 },
+        },
+        controller => 'Withdraw',
+        swagger => { summary => 'Удаление списания клиента' },
     },
 },
 '/admin/user/service/status' => {
+    swagger => { tags => 'Услуги пользователей' },
     POST => {
         controller => 'USObject',
         method => 'set_status_manual',
-        required => ['user_id','user_service_id','status'],
+        params => {
+            user_id         => { type => 'integer', required => 1, min => 1 },
+            user_service_id => { type => 'integer', required => 1, min => 1 },
+            status          => { type => 'string', required => 1, enum => ['ACTIVE','BLOCK'] },
+        },
+        swagger => { summary => 'Смена статуса услуги клиента' },
     },
 },
 '/admin/user/service/stop' => {
+    swagger => { tags => 'Услуги пользователей' },
     POST => {
         controller => 'USObject',
-        method => 'block',
-        required => ['user_id','user_service_id'],
+        method => 'block_force',
+        params => {
+            user_id         => { type => 'integer', required => 1, min => 1 },
+            user_service_id => { type => 'integer', required => 1, min => 1 },
+        },
+        swagger => { summary => 'Остановка услуги клиента' },
     },
 },
 '/admin/user/service/activate' => {
+    swagger => { tags => 'Услуги пользователей' },
     POST => {
         controller => 'USObject',
-        method => 'activate',
-        required => ['user_id','user_service_id'],
+        method => 'activate_force',
+        params => {
+            user_id         => { type => 'integer', required => 1, min => 1 },
+            user_service_id => { type => 'integer', required => 1, min => 1 },
+        },
+        swagger => { summary => 'Возобновление услуги клиента' },
+    },
+},
+'/admin/user/service/touch' => {
+    swagger => { tags => 'Услуги пользователей' },
+    POST => {
+        controller => 'USObject',
+        method => 'touch_api',
+        params => {
+            user_id         => { type => 'integer', required => 1, min => 1 },
+            user_service_id => { type => 'integer', required => 1, min => 1 },
+        },
+        swagger => { summary => 'Обработка услуги' },
+    },
+},
+'/admin/user/service/change' => {
+    swagger => { tags => 'Услуги пользователей' },
+    POST => {
+        controller => 'USObject',
+        method => 'change',
+        params => {
+            user_id              => { type => 'integer', required => 1, min => 1 },
+            user_service_id      => { type => 'integer', required => 1, min => 1 },
+            service_id           => { type => 'integer', required => 1, min => 1 },
+            finish_active        => { type => 'boolean' },
+            allow_partial_period => { type => 'boolean' },
+        },
+        swagger => { summary => 'Смена тарифа услуги клиента' },
     },
 },
 '/admin/user/service/spool' => {
+    swagger => { tags => ['Услуги пользователей','Задачи'] },
     GET => {
         controller => 'USObject',
         method => 'api_spool_commands',
-        required => ['id'],
+        params => {
+            user_id         => { type => 'integer', required => 1, min => 1 },
+            user_service_id => { type => 'integer', required => 1, min => 1 },
+        },
+        swagger => { summary => 'Получение списка текущих задач для услуги клиента' },
     },
 },
 '/admin/user/session' => {
+    swagger => { tags => 'Пользователи' },
     PUT => {
         controller => 'User',
         method => 'gen_session',
-        required => ['user_id'],
+        params => {
+            user_id => { type => 'integer', required => 1, min => 1 },
+        },
+        args => {
+            format => 'json',
+        },
+        swagger => {
+            summary => 'Генерация session_id для клиента',
+                responses => {
+                '200' => {
+                    content => {
+                        'application/json' => {
+                            schema => {
+                                type => 'object',
+                                properties => {
+                                    id => {
+                                        type => 'string'
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
     },
 },
 '/admin/server' => {
+    swagger => { tags => 'Сервера' },
     GET => {
+        params => {
+            server_id  => { type => 'integer', min => 1 },
+        },
         controller => 'Server',
+        swagger => { summary => 'Получение списка серверов' },
     },
     PUT => {
         controller => 'Server',
+        swagger => { summary => 'Создание сервера' },
     },
     POST => {
         controller => 'Server',
+        swagger => { summary => 'Изменение сервера' },
     },
     DELETE => {
+        params => {
+            server_id => { type => 'integer', required => 1, min => 1 },
+        },
         controller => 'Server',
+        swagger => { summary => 'Удаление сервера' },
     },
 },
 '/admin/server/group' => {
+    swagger => { tags => 'Группы серверов' },
     GET => {
+        params => {
+            group_id  => { type => 'integer', min => 1 },
+        },
         controller => 'ServerGroups',
+        swagger => { summary => 'Получение списка групп серверов' },
     },
     PUT => {
         controller => 'ServerGroups',
+        swagger => { summary => 'Создание группы серверов' },
     },
     POST => {
         controller => 'ServerGroups',
+        swagger => { summary => 'Изменение группы серверов' },
     },
     DELETE => {
+        params => {
+            group_id => { type => 'integer', required => 1, min => 1 },
+        },
         controller => 'ServerGroups',
+        swagger => { summary => 'Удаление группы серверов' },
     },
 },
 '/admin/server/identity' => {
+    swagger => { tags => 'Ключи SSH' },
     GET => {
+        params => {
+            id     => { type => 'integer', min => 1 },
+        },
         controller => 'Identities',
+        swagger => { summary => 'Список SSH ключей' },
     },
     PUT => {
         controller => 'Identities',
+        swagger => { summary => 'Сохранение нового SSH ключа' },
     },
     POST => {
         controller => 'Identities',
+        swagger => { summary => 'Изменение SSH ключа' },
     },
     DELETE => {
+        params => {
+            id => { type => 'integer', required => 1, min => 1 },
+        },
         controller => 'Identities',
+        swagger => { summary => 'Удаление SSH ключа' },
     },
 },
 '/admin/server/identity/generate' => {
+    swagger => { tags => 'Ключи SSH' },
     GET => {
+        params => {
+            type => { type => 'string', enum => ['rsa','dsa','ecdsa','ed25519'] },
+        },
         controller => 'Identities',
         method => 'generate_key_pair',
+        swagger => { summary => 'Генерация SSH ключей' },
     },
 },
 '/admin/spool' => {
+    swagger => { tags => 'Задачи' },
     GET => {
+        params => {
+            id              => { type => 'integer', min => 1 },
+            user_id         => { type => 'integer', min => 1 },
+            user_service_id => { type => 'integer', min => 1 },
+            status          => { type => 'string' },
+        },
         controller => 'Spool',
+        swagger => { summary => 'Список текущих задач' },
     },
     PUT => {
         controller => 'Spool',
+        swagger => { summary => 'Создание задачи' },
     },
     POST => {
         controller => 'Spool',
+        swagger => { summary => 'Изменение задачи' },
     },
     DELETE => {
+        params => {
+            id => { type => 'integer', required => 1, min => 1 },
+        },
         controller => 'Spool',
+        swagger => { summary => 'Удаление задачи' },
+    },
+},
+'/admin/spool/statuses' => {
+    swagger => { tags => 'Задачи' },
+    GET => {
+        params => {},
+        controller => 'Spool',
+        method => 'statuses',
+        swagger => { summary => 'Статусы задач' },
+    },
+},
+'/admin/spool/queues' => {
+    swagger => { tags => 'Задачи' },
+    GET => {
+        params => {
+            id   => { type => 'integer', min => 1 },
+            name => { type => 'string' },
+        },
+        controller => 'SpoolQueue',
+        swagger => { summary => 'Список очередей задач' },
+    },
+    PUT => {
+        controller => 'SpoolQueue',
+        swagger => { summary => 'Создание очереди задач' },
+    },
+    POST => {
+        controller => 'SpoolQueue',
+        swagger => { summary => 'Изменение очереди задач' },
+    },
+},
+'/admin/spool/queues/delete' => {
+    swagger => { tags => 'Задачи' },
+    POST => {
+        params => { id => { type => 'integer', required => 1, min => 1 } },
+        controller => 'SpoolQueue',
+        method => 'api_delete_cascade',
+        swagger => { summary => 'Удалить очередь и архивировать все её задачи' },
+    },
+},
+'/admin/spool/queues/pause' => {
+    swagger => { tags => 'Задачи' },
+    POST => {
+        params => { id => { type => 'integer', required => 1, min => 1 } },
+        controller => 'SpoolQueue',
+        method => 'api_pause',
+        swagger => { summary => 'Приостановить очередь задач' },
+    },
+},
+'/admin/spool/queues/resume' => {
+    swagger => { tags => 'Задачи' },
+    POST => {
+        params => { id => { type => 'integer', required => 1, min => 1 } },
+        controller => 'SpoolQueue',
+        method => 'api_resume',
+        swagger => { summary => 'Возобновить очередь задач' },
     },
 },
 '/admin/spool/history' => {
+    swagger => { tags => 'Задачи' },
     GET => {
         controller => 'SpoolHistory',
+        swagger => { summary => 'Список архива задач' },
     },
 },
-'/admin/spool/:action' => {
+'/admin/spool/manual/*' => {
+    swagger => { tags => 'Задачи' },
+    splat_to => 'action',
     POST => {
+        params => {
+            id => { type => 'integer', required => 1, min => 1 },
+            action => { type => 'string', enum => ['success','pause','retry','resume'] },
+        },
         controller => 'Spool',
         method => 'api_manual_action',
-        required => ['id','action'],
+        swagger => { summary => 'Изменение статуса задачи вручную' },
     },
 },
 '/admin/template' => {
+    swagger => { tags => 'Шаблоны' },
     GET => {
         controller => 'Template',
         method => 'list',
+        common_params => 1,
+        swagger => { summary => 'Список шаблонов' },
     },
     PUT => {
         controller => 'Template',
+        allow_text_plain => 1,
+        swagger => { summary => 'Создание шаблона' },
+        args => {
+            format => 'plain',
+        },
     },
     POST => {
         controller => 'Template',
+        allow_text_plain => 1,
+        swagger => { summary => 'Изменение шаблона' },
+        args => {
+            format => 'plain',
+        },
     },
     DELETE => {
+        params => {
+            id => { type => 'string', required => 1, min => 1 },
+        },
         controller => 'Template',
+        swagger => { summary => 'Удаление шаблона' },
     },
 },
 '/admin/template/*' => {
+    swagger => { tags => 'Шаблоны' },
+    splat_to => 'id',
     GET => {
         controller => 'Template',
-        method => 'show',
-        required => ['splat'],
+        method => 'parse_for_api',
+        common_params => 1,
         args => {
             format => 'plain',
             do_not_parse => 1,
         },
+        swagger => { summary => 'Чтение шаблона' },
     },
     PUT => {
         controller => 'Template',
-        required => ['splat','PUTDATA'],
+        args => {
+            format => 'plain',
+        },
     },
     POST => {
         controller => 'Template',
-        required => ['splat','POSTDATA'],
+        args => {
+            format => 'plain',
+        },
     },
     DELETE => {
+        params => {
+            id  => { type => 'string', required => 1, min => 1 },
+        },
         controller => 'Template',
-        required => ['splat'],
     },
 },
 '/admin/storage/manage' => {
+    swagger => { tags => 'Хранилище' },
     GET => {
+        params => {
+            user_id => { type => 'integer', min => 1 },
+            name    => { type => 'string', max_length => 255 },
+        },
         controller => 'Storage',
+        swagger => { summary => 'Получение списка объектов хранилища' },
     },
-},
-'/admin/storage/manage/:name' => {
+    PUT => {
+        controller => 'Storage',
+        swagger => { summary => 'Создание объекта в хранилище' },
+    },
     POST => {
         controller => 'Storage',
         method => 'replace',
-        required => ['name','user_id'],
+        swagger => { summary => 'Изменение данных в объекте хранилища' },
     },
     DELETE => {
+        params => {
+            user_id => { type => 'integer', required => 1, min => 1 },
+            name    => { type => 'string', required => 1, min_length => 1, max_length => 255 },
+        },
         controller => 'Storage',
         method => 'delete',
-        required => ['name','user_id'],
+        swagger => { summary => 'Удаление объекта из хранилища' },
+    },
+},
+'/admin/storage/manage/*' => {
+    swagger => { tags => 'Хранилище' },
+    splat_to => 'name',
+    GET => {
+        params => {
+            user_id => { type => 'integer', required => 1, min => 1 },
+            name => { type => 'string', required => 1, min_length => 1, max_length => 32 },
+        },
+        controller => 'Storage',
+        method => 'read',
+        args => {
+            format => 'other',
+        },
+        swagger => { summary => 'Получение объекта хранилища' },
+    },
+    POST => {
+        controller => 'Storage',
+        method => 'replace',
+    },
+    DELETE => {
+        params => {
+            user_id => { type => 'integer', required => 1, min => 1 },
+            name => { type => 'string', required => 1, min_length => 1, max_length => 32 },
+        },
+        controller => 'Storage',
+        method => 'delete',
     },
 },
 '/admin/config' => {
+    swagger => { tags => 'Конфигурация' },
     GET => {
+        params => {
+            key    => { type => 'string', max_length => 128 },
+        },
         controller => 'Config',
+        swagger => { summary => 'Чтение конфига' },
     },
     PUT => {
         controller => 'Config',
+        swagger => { summary => 'Создание объекта в конфиге' },
     },
     POST => {
         controller => 'Config',
+        swagger => { summary => 'Изменение объекта в конфиге' },
     },
     DELETE => {
+        params => {
+            key => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+        },
         controller => 'Config',
+        swagger => { summary => 'Удаление объекта из конфига' },
     },
 },
-'/admin/config/:key' => {
+'/admin/config/*' => {
+    swagger => { tags => 'Конфигурация' },
+    splat_to => 'key',
     GET => {
+        params => {},
         controller => 'Config',
         method => 'api_data_by_name',
-        required => ['key'],
+        swagger => { summary => 'Получение объекта конфига' },
+    },
+    POST => {
+        controller => 'Config',
+        params => {},
+        method => 'api_set_value',
+        skip_auto_parse_json => 1,
+        swagger => { summary => 'Изменение объекта в конфиге' },
+    },
+    DELETE => {
+        params => {
+            value => { type => 'string', required => 1, min_length => 1, max_length => 256 },
+        },
+        controller => 'Config',
+        method => 'api_delete_value',
+        swagger => { summary => 'Удаление значения или объекта конфига' },
     },
 },
 '/admin/console' => {
@@ -560,55 +1598,175 @@ my $routes = {
 },
 '/admin/transport/ssh/test' => {
     PUT => {
+        params => {
+            host   => { type => 'string', required => 1, min_length => 1, max_length => 255 },
+            key_id => { type => 'integer', required => 1, min => 1 },
+            server_id => { type => 'integer', required => 1, min => 1 },
+            template_id => { type => 'string', min_length => 1 },
+            cmd => { type => 'string', min_length => 1 },
+            event_name => { type => 'string', min_length => 1},
+            timeout => { type => 'integer', min => 1, default => 600 },
+        },
         controller => 'Transport::Ssh',
         method => 'ssh_test',
-        required => [
-            'host',
-            'key_id',
-        ],
     },
 },
 '/admin/transport/ssh/init' => {
     PUT => {
+        params => {
+            host        => { type => 'string', required => 1, min_length => 1, max_length => 255 },
+            key_id      => { type => 'integer', required => 1, min => 1 },
+            server_id => { type => 'integer', required => 1, min => 1 },
+            template_id => { type => 'string', min_length => 1 },
+            cmd => { type => 'string', min_length => 1 },
+            event_name => { type => 'string', min_length => 1},
+            timeout => { type => 'integer', min => 1, default => 600 },
+        },
         controller => 'Transport::Ssh',
         method => 'ssh_init',
-        required => [
-            'host',
-            'key_id',
-            'template_id',
-        ],
-    },
-},
-'/admin/transport/mail/test' => {
-    POST => {
-
     },
 },
 '/admin/promo' => {
+    swagger => { tags => 'Промокоды' },
     GET => {
+        params => {
+            id     => { type => 'integer', min => 1 },
+        },
         controller => 'Promo',
+        swagger => { summary => 'Список промокодов' },
     },
     PUT => {
         controller => 'Promo',
         method => 'generate',
+        swagger => { summary => 'Генерация промокодов' },
     },
-},
-'/admin/promo/:id' => {
     POST => {
         controller => 'Promo',
         method => 'update',
-        required => ['id','user_id'],
+        swagger => { summary => 'Изменение промокода' },
+    },
+    DELETE => {
+        params => {
+            id => { type => 'integer', required => 1, min => 1 },
+        },
+        controller => 'Promo',
+        method => 'delete',
+        swagger => { summary => 'Удаление промокода' },
+    },
+},
+'/admin/promo/*' => {
+    POST => {
+        controller => 'Promo',
+        method => 'update',
     },
     DELETE => {
         controller => 'Promo',
         method => 'delete',
-        required => ['id'],
     },
 },
-
+'/admin/logs/api' => {
+    swagger => { tags => 'Логи' },
+    GET => {
+        params => {
+            user_id       => { type => 'integer', min => 1 },
+            response_code => { type => 'integer', min => 0 },
+            url           => { type => 'string',  max_length => 512 },
+            method        => { type => 'string',  max_length => 10 },
+        },
+        controller => 'Logs::Api',
+        swagger => { summary => 'Список логов API' },
+    },
+},
+'/admin/analytics' => {
+    GET => {
+        params => {
+            months => { type => 'integer' },
+            no_cache => { type => 'boolean' },
+        },
+        controller => 'Analytics',
+        method => 'api_report',
+    },
+},
+'/admin/analytics/cache/clear' => {
+    POST => {
+        params => {},
+        controller => 'Analytics',
+        method => 'clear_cache',
+    },
+},
+'/telegram/user' => {
+    swagger => {
+        tags => 'Telegram bot',
+    },
+    GET => {
+        params => {},
+        controller => 'Transport::Telegram',
+        method => 'user_tg_settings',
+        args => {
+            format => 'json',
+        },
+        swagger => {
+            summary => 'Получение настроек пользователя для Telegram бота',
+        },
+    },
+    POST => {
+        params => {},
+        controller => 'Transport::Telegram',
+        method => 'api_set_user_tg_settings',
+        skip_auto_parse_json => 1,
+        args => {
+            format => 'json',
+        },
+        swagger => {
+            summary => 'Изменение настроек пользователя для Telegram бота',
+        },
+    },
+    DELETE => {
+        params => {},
+        controller => 'Transport::Telegram',
+        method => 'api_delete_user_tg_settings',
+        args => {
+            format => 'json',
+        },
+        swagger => {
+            summary => 'Удаление Telegram аккаунта пользователя',
+        },
+    },
+},
 '/telegram/bot' => {
     POST => {
+        params => {
+            # Telegram Update object fields (https://core.telegram.org/bots/api#update)
+            tg_profile              => { type => 'string' },
+            update_id               => { type => 'integer', min => 1 },
+            message                 => { type => 'object' },
+            edited_message          => { type => 'object' },
+            channel_post            => { type => 'object' },
+            edited_channel_post     => { type => 'object' },
+            business_connection     => { type => 'object' },
+            business_message        => { type => 'object' },
+            edited_business_message => { type => 'object' },
+            deleted_business_messages => { type => 'object' },
+            guest_message           => { type => 'object' },
+            message_reaction        => { type => 'object' },
+            message_reaction_count  => { type => 'object' },
+            inline_query            => { type => 'object' },
+            chosen_inline_result    => { type => 'object' },
+            callback_query          => { type => 'object' },
+            shipping_query          => { type => 'object' },
+            pre_checkout_query      => { type => 'object' },
+            purchased_paid_media    => { type => 'object' },
+            poll                    => { type => 'object' },
+            poll_answer             => { type => 'object' },
+            my_chat_member          => { type => 'object' },
+            chat_member             => { type => 'object' },
+            chat_join_request       => { type => 'object' },
+            chat_boost              => { type => 'object' },
+            removed_chat_boost      => { type => 'object' },
+            managed_bot             => { type => 'object' },
+        },
         skip_check_auth => 1,
+        skip_errors => 1, # do not send report errors to TG API
         controller => 'Transport::Telegram',
         method => 'process_message',
         args => {
@@ -617,43 +1775,625 @@ my $routes = {
     },
 },
 '/telegram/bot/*' => {
+    swagger => {
+        tags => 'Telegram bot',
+    },
+    splat_to => 'template',
     POST => {
+        params => {
+            # Telegram Update object fields (https://core.telegram.org/bots/api#update)
+            tg_profile              => { type => 'string' },
+            update_id               => { type => 'integer', min => 1 },
+            message                 => { type => 'object' },
+            edited_message          => { type => 'object' },
+            channel_post            => { type => 'object' },
+            edited_channel_post     => { type => 'object' },
+            business_connection     => { type => 'object' },
+            business_message        => { type => 'object' },
+            edited_business_message => { type => 'object' },
+            deleted_business_messages => { type => 'object' },
+            guest_message           => { type => 'object' },
+            message_reaction        => { type => 'object' },
+            message_reaction_count  => { type => 'object' },
+            inline_query            => { type => 'object' },
+            chosen_inline_result    => { type => 'object' },
+            callback_query          => { type => 'object' },
+            shipping_query          => { type => 'object' },
+            pre_checkout_query      => { type => 'object' },
+            purchased_paid_media    => { type => 'object' },
+            poll                    => { type => 'object' },
+            poll_answer             => { type => 'object' },
+            my_chat_member          => { type => 'object' },
+            chat_member             => { type => 'object' },
+            chat_join_request       => { type => 'object' },
+            chat_boost              => { type => 'object' },
+            removed_chat_boost      => { type => 'object' },
+            managed_bot             => { type => 'object' },
+        },
         skip_check_auth => 1,
+        skip_errors => 1, # do not send report errors to TG API
         controller => 'Transport::Telegram',
         method => 'process_message',
-        required => ['splat'],
-        splat_to => 'template',
         args => {
             format => 'json',
         },
+        swagger => {
+            summary => 'Приём данных от Telegram',
+        },
     },
 },
-'/telegram/webapp/auth' => {
+'/telegram/set_webhook' => {
+    POST => {
+        params => {
+            url             => { type => 'string', required => 1, min_length => 1, max_length => 2048 },
+            token           => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+            secret          => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+            template_id     => { type => 'string', required => 1, min_length => 1 },
+            tg_profile      => { type => 'string', required => 1, min_length => 1 },
+            allowed_updates => { type => 'array' },
+        },
+        controller => 'Transport::Telegram',
+        method => 'set_webhook',
+        args => {
+            format => 'json',
+        },
+        swagger => {
+            summary => 'Установка Webhook в Telegram бота',
+        },
+    },
+},
+'/telegram/delete_webhook' => {
+    POST => {
+        params => {
+            token => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+        },
+        skip_check_auth => 1,
+        controller => 'Transport::Telegram',
+        method => 'delete_webhook',
+        args => {
+            format => 'json',
+        },
+        swagger => {
+            summary => 'Удаление Webhook в Telegram бота',
+        },
+    },
+},
+
+# ─── MAX (VK / OK messenger) bot ─────────────────────────────────────────────
+'/max/bot/*' => {
+    swagger  => { tags => 'MAX bot' },
+    splat_to => 'template',
+    POST => {
+        params => {
+            profile     => { type => 'string' },
+            update_type => { type => 'string' },
+            timestamp   => { type => 'integer' },
+            message     => { type => 'object' },
+            callback    => { type => 'object' },
+            user        => { type => 'object' },
+            chat_id     => { type => 'integer' },
+            user_id     => { type => 'integer' },
+        },
+        skip_check_auth => 1,
+        skip_errors     => 1,
+        controller => 'Transport::Max',
+        method     => 'process_message',
+        args       => { format => 'json' },
+        swagger    => { summary => 'Webhook от MAX бота (с шаблоном)' },
+    },
+},
+'/max/set_webhook' => {
+    swagger => { tags => 'MAX bot' },
+    POST => {
+        params => {
+            url          => { type => 'string', required => 1, min_length => 1, max_length => 2048 },
+            token        => { type => 'string', required => 1, min_length => 1, max_length => 256 },
+            secret       => { type => 'string', min_length => 5, max_length => 256 },
+            template_id  => { type => 'string', required => 1, min_length => 1 },
+            profile      => { type => 'string', min_length => 1 },
+            update_types => { type => 'object' },
+        },
+        skip_check_auth => 1,
+        controller => 'Transport::Max',
+        method     => 'set_webhook',
+        args       => { format => 'json' },
+        swagger    => { summary => 'Установка Webhook для MAX бота' },
+    },
+},
+
+'/max/webapp/auth' => {
+    swagger => { tags => 'MAX bot' },
     GET => {
+        params => {
+            initData => { type => 'string', required => 1, min_length => 1, max_length => 4096 },
+            profile  => { type => 'string', min_length => 1, max_length => 64 },
+        },
+        skip_check_auth => 1,
+        controller => 'Transport::Max',
+        method     => 'webapp_auth',
+        args       => { format => 'json' },
+        swagger    => { summary => 'Авторизация MAX WebApp (валидация initData)' },
+    },
+},
+
+'/telegram/webapp/auth' => {
+    swagger => {
+        tags => 'Telegram bot',
+    },
+    GET => {
+        params => {
+            initData => { type => 'string', required => 1, min_length => 1, max_length => 4096 },
+            profile => { type => 'string', required => 1, min_length => 1, max_length => 32 },
+        },
         skip_check_auth => 1,
         controller => 'Transport::Telegram',
         method => 'webapp_auth',
-        required => ['uid'],
+        args => {
+            format => 'json',
+        },
+        swagger => {
+            summary => 'Авторизация Telegram',
+             responses => {
+                '200' => {
+                    content => {
+                        'application/json' => {
+                            schema => {
+                                type => 'object',
+                                properties => {
+                                    session_id => {
+                                        type => 'string'
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+},
+'/telegram/web/auth' => {
+    swagger => {
+        tags => 'Telegram bot',
+    },
+    POST => {
+        params => {
+            profile          => { type => 'string' },
+            register_if_not_exists => { type => 'boolean' },
+            bind_to_profile  => { type => 'boolean' },
+            bind_only_if_new => { type => 'boolean' },
+            session_id              => { type => 'integer', min => 1 },
+            # OIDC code flow
+            code             => { type => 'string' },
+            redirect_uri     => { type => 'string' },
+            code_verifier    => { type => 'string' },
+            client_id        => { type => 'string' },
+            client_secret    => { type => 'string' },
+            state            => { type => 'string' },
+            expected_state   => { type => 'string' },
+            id_token         => { type => 'string' },
+            nonce            => { type => 'string' },
+            # Legacy widget fields
+            id               => { type => 'string' },
+            first_name       => { type => 'string' },
+            last_name        => { type => 'string' },
+            username         => { type => 'string' },
+            photo_url        => { type => 'string' },
+            auth_date        => { type => 'string' },
+            hash             => { type => 'string' },
+            query            => { type => 'string' },
+        },
+        skip_check_auth => 1,
+        controller => 'Transport::Telegram',
+        method => 'web_auth',
+        swagger => {
+            summary => 'Авторизация через Telegram Login (OIDC id_token или legacy Widget)',
+             responses => {
+                '200' => {
+                    content => {
+                        'application/json' => {
+                            schema => {
+                                type => 'object',
+                                properties => {
+                                    session_id => {
+                                        type => 'string'
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+},
+'/telegram/web/auth/init' => {
+    swagger => {
+        tags => 'Telegram bot',
+    },
+    GET => {
+        params => {
+            profile                => { type => 'string' },
+            redirect_uri           => { type => 'string' },
+            return_url             => { type => 'string' },
+            scope                  => { type => 'string' },
+            register_if_not_exists => { type => 'boolean' },
+            bind_to_profile        => { type => 'boolean' },
+            bind_only_if_new       => { type => 'boolean' },
+            session_id             => { type => 'integer', min => 1 },
+            ttl                    => { type => 'integer', min => 1 },
+        },
+        skip_check_auth => 1,
+        controller => 'Transport::Telegram',
+        method => 'telegram_oidc_init',
+        swagger => {
+            summary => 'Инициализация Telegram Login OIDC (state, nonce, PKCE)',
+            responses => {
+                '200' => {
+                    content => {
+                        'application/json' => {
+                            schema => {
+                                type => 'object',
+                                properties => {
+                                    auth_url => { type => 'string' },
+                                    state => { type => 'string' },
+                                    nonce => { type => 'string' },
+                                    code_challenge => { type => 'string' },
+                                    code_challenge_method => { type => 'string' },
+                                    redirect_uri => { type => 'string' },
+                                    expires_in => { type => 'number' },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+},
+'/telegram/web/auth/start' => {
+    swagger => {
+        tags => 'Telegram bot',
+    },
+    GET => {
+        params => {
+            profile                => { type => 'string' },
+            redirect_uri           => { type => 'string' },
+            return_url             => { type => 'string' },
+            scope                  => { type => 'string' },
+            register_if_not_exists => { type => 'boolean' },
+            bind_to_profile        => { type => 'boolean' },
+            bind_only_if_new       => { type => 'boolean' },
+            session_id             => { type => 'integer', min => 1 },
+            ttl                    => { type => 'integer', min => 1 },
+        },
+        skip_check_auth => 1,
+        controller => 'Transport::Telegram',
+        method => 'telegram_oidc_start_redirect',
+        swagger => {
+            summary => 'Старт Telegram Login OIDC с HTTP redirect на Telegram OAuth',
+            responses => {
+                '302' => {
+                    description => 'Redirect to Telegram OAuth',
+                },
+            },
+        },
+    },
+},
+'/telegram/web/callback' => {
+    swagger => {
+        tags => 'Telegram bot',
+    },
+    GET => {
+        params => {
+            profile                => { type => 'string' },
+            register_if_not_exists => { type => 'boolean' },
+            bind_to_profile        => { type => 'boolean' },
+            bind_only_if_new       => { type => 'boolean' },
+            session_id             => { type => 'integer', min => 1 },
+            # OIDC code flow
+            code                   => { type => 'string' },
+            redirect_uri           => { type => 'string' },
+            return_url             => { type => 'string' },
+            code_verifier          => { type => 'string' },
+            state                  => { type => 'string' },
+            expected_state         => { type => 'string' },
+            client_id              => { type => 'string' },
+            client_secret          => { type => 'string' },
+            id_token               => { type => 'string' },
+            nonce                  => { type => 'string' },
+        },
+        skip_check_auth => 1,
+        controller => 'Transport::Telegram',
+        method => 'web_auth_callback',
+        swagger => {
+            summary => 'Callback endpoint для Telegram Login (OIDC code flow)',
+            responses => {
+                '200' => {
+                    content => {
+                        'application/json' => {
+                            schema => {
+                                type => 'object',
+                                properties => {
+                                    session_id => {
+                                        type => 'string'
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+},
+'/oauth2/init/*' => {
+    swagger => { tags => 'oauth2' },
+    splat_to => 'provider',
+    GET => {
+        params => {
+            redirect_uri            => { type => 'string' },
+            return_url              => { type => 'string' },
+            bind_to_profile         => { type => 'boolean' },
+            bind_only_if_new        => { type => 'boolean' },
+            session_id              => { type => 'string' },
+            ttl                     => { type => 'integer', min => 1 },
+        },
+        skip_check_auth => 1,
+        controller => 'Auth::OAuth2',
+        method => 'oauth2_init',
+        swagger => {
+            summary => 'Инициализация OAuth2-входа/привязки (Google/Yandex/VK/GitHub): state, nonce, PKCE',
+            responses => {
+                '200' => {
+                    content => {
+                        'application/json' => {
+                            schema => {
+                                type => 'object',
+                                properties => {
+                                    auth_url => { type => 'string' },
+                                    state => { type => 'string' },
+                                    nonce => { type => 'string' },
+                                    code_challenge => { type => 'string' },
+                                    code_challenge_method => { type => 'string' },
+                                    redirect_uri => { type => 'string' },
+                                    expires_in => { type => 'number' },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+},
+'/oauth2/start/*' => {
+    swagger => { tags => 'oauth2' },
+    splat_to => 'provider',
+    GET => {
+        params => {
+            redirect_uri            => { type => 'string' },
+            return_url              => { type => 'string' },
+            bind_to_profile         => { type => 'boolean' },
+            bind_only_if_new        => { type => 'boolean' },
+            session_id              => { type => 'string' },
+            ttl                     => { type => 'integer', min => 1 },
+        },
+        skip_check_auth => 1,
+        controller => 'Auth::OAuth2',
+        method => 'oauth2_start_redirect',
+        swagger => {
+            summary => 'Старт OAuth2-входа/привязки с HTTP redirect на провайдера',
+            responses => {
+                '302' => { description => 'Redirect to provider OAuth' },
+            },
+        },
+    },
+},
+'/oauth2/callback/*' => {
+    swagger => { tags => 'oauth2' },
+    splat_to => 'provider',
+    GET => {
+        params => {
+            bind_to_profile        => { type => 'boolean' },
+            bind_only_if_new       => { type => 'boolean' },
+            # SECURITY: нет клиентского uid — см. комментарий в /oauth2/init/*.
+            session_id             => { type => 'string' },
+            code                   => { type => 'string' },
+            redirect_uri           => { type => 'string' },
+            return_url             => { type => 'string' },
+            code_verifier          => { type => 'string' },
+            state                  => { type => 'string' },
+            expected_state         => { type => 'string' },
+        },
+        skip_check_auth => 1,
+        controller => 'Auth::OAuth2',
+        method => 'oauth2_callback_redirect',
+        swagger => {
+            summary => 'Callback endpoint для OAuth2-входа/привязки (Google/Yandex/VK/GitHub)',
+            responses => {
+                '200' => {
+                    content => {
+                        'application/json' => {
+                            schema => {
+                                type => 'object',
+                                properties => {
+                                    session_id => { type => 'string' },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+},
+'/admin/cloud/user' => {
+    GET => {
+        params => {},
+        controller => 'Cloud',
+        method => 'get_user',
+    },
+    PUT => {
+        params => {
+            login          => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+            password       => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+            captcha_token  => { type => 'string' },
+            captcha_answer => { type => 'string' },
+        },
+        controller => 'Cloud',
+        method => 'reg_user',
+    },
+},
+'/admin/cloud/user/auth' => {
+    swagger => {
+        tags => 'Cloud SHM',
+    },
+    POST => {
+        params => {
+            login    => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+            password => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+        },
+        controller => 'Cloud',
+        method => 'login_user',
+    },
+    DELETE => {
+        params => {},
+        controller => 'Cloud',
+        method => 'logout_user',
+    },
+},
+'/admin/cloud/paysystems' => {
+    GET => {
+        params => {},
+        controller => 'Cloud',
+        method => 'paysystems',
+    },
+},
+'/admin/cloud/currencies' => {
+    GET => {
+        params => {
+            no_cache => { type => 'boolean' },
+        },
+        controller => 'Cloud::Currency',
+        method => 'currencies',
+    },
+    POST => {
+        params => {
+            currencies => { type => 'object', required => 1 },
+        },
+        controller => 'Cloud::Currency',
+        method => 'save',
+    },
+},
+'/admin/cloud/proxy/*' => {
+    splat_to => 'uri',
+    GET => {
+        params => {},
+        controller => 'Cloud',
+        method => 'proxy',
         args => {
             format => 'json',
         },
     },
-},
+    POST => {
+        params => {},
+        controller => 'Cloud',
+        method => 'proxy',
+        args => {
+            format => 'json',
+        },
+    },
+    PUT => {
+        params => {},
+        controller => 'Cloud',
+        method => 'proxy',
+        args => {
+            format => 'json',
+        },
+    },
+    DELETE => {
+        params => {},
+        controller => 'Cloud',
+        method => 'proxy',
+        args => {
+            format => 'json',
+        },
+    },
+}
 
 };
 
-my $router = Router::Simple->new();
+$routes->{'/swagger.json'} //= {
+    GET => {
+        params => {},
+        controller => 'Swagger',
+        method => 'gen_swagger_json',
+        skip_check_auth => 1,
+        args => {
+            routes => $routes,
+            format => 'json',
+        },
+    },
+};
+
+$routes->{'/swagger_admin.json'} //= {
+    GET => {
+        params => {},
+        controller => 'Swagger',
+        method => 'gen_swagger_json',
+        skip_check_auth => 1,
+        args => {
+            routes => $routes,
+            admin_mode => 1,
+            format => 'json',
+        },
+    },
+};
+
+$routes->{'/system/locations'} //= {
+    swagger => { tags => 'Служебное' },
+    GET => {
+        params => {},
+        controller => 'Swagger',
+        method => 'list_locations',
+        args => {
+            routes => $routes,
+        },
+        swagger => { summary => 'Список доступных локейшенов и методов (пользователи)' },
+    },
+};
+
+$routes->{'/admin/system/locations'} //= {
+    swagger => { tags => 'Служебное' },
+    GET => {
+        params => {},
+        controller => 'Swagger',
+        method => 'list_locations',
+        args => {
+            routes => $routes,
+            admin_mode => 1,
+        },
+        swagger => { summary => 'Список доступных локейшенов и методов (админ)' },
+    },
+};
+
+state $router //= Router::Simple->new();
 for my $uri ( keys %{ $routes } ) {
-    for my $method ( keys %{ $routes->{$uri} } ) {
+    for my $method ( 'GET','POST','PUT','DELETE' ) {
+        next unless $routes->{$uri}->{$method};
+        $routes->{$uri}->{$method}->{splat_to} = $routes->{$uri}->{splat_to} if $routes->{$uri}->{splat_to};
         $router->connect( sprintf("%s:%s", $method, $uri), $routes->{$uri}->{$method} );
     }
 }
 
+our $request_start = Time::HiRes::time();
 my $uri = $ENV{PATH_INFO};
 our %in;
 
 if ( my $p = $router->match( sprintf("%s:%s", $ENV{REQUEST_METHOD}, $uri )) ) {
 
+    my $api_descr = $p->{swagger}{summary};
     %in = parse_args( auto_parse_json => $p->{skip_auto_parse_json} ? 0 : 1 );
     $in{filter} = decode_json( $in{filter} ) if $in{filter};
 
@@ -667,19 +2407,30 @@ if ( my $p = $router->match( sprintf("%s:%s", $ENV{REQUEST_METHOD}, $uri )) ) {
     );
 
     if ( $user->is_blocked ) {
+        _log_api_call( $user, code => 403, error => 'User is blocked', descr => $api_descr );
         print_header( status => 403 );
-        print_json( { error => "User is blocked"} );
+        print_json( { status => 403, error => "User is blocked"} );
         exit 0;
     }
 
     my $admin_mode;
     if ( $uri =~/^\/admin\// ) {
         unless ( $user->is_admin ) {
+            _log_api_call( $user, code => 403, error => 'Permission denied', descr => $api_descr );
             print_header( status => 403 );
-            print_json( { error => "Permission denied"} );
+            print_json( { status => 403, error => "Permission denied"} );
             exit 0;
         }
         $admin_mode = 1;
+    }
+
+    unless ( $p->{skip_check_auth} ) {
+        unless ( $user->can_access( uri => $uri, method => $ENV{REQUEST_METHOD} ) ) {
+            _log_api_call( $user, code => 403, error => 'Permission denied', descr => $api_descr );
+            print_header( status => 403 );
+            print_json( { status => 403, error => "Permission denied"} );
+            exit 0;
+        }
     }
 
     my %args = (
@@ -688,28 +2439,57 @@ if ( my $p = $router->match( sprintf("%s:%s", $ENV{REQUEST_METHOD}, $uri )) ) {
         admin => $admin_mode,
     );
 
-    delete $args{user_id} unless $user->is_admin;
-
-    if ( $user->is_admin && $args{user_id} ) {
+    # User-switching (impersonation) is only allowed for a genuinely
+    # authenticated admin (session/login/basic-auth). Routes that force a
+    # fixed context user via route config (e.g. /public/* uses user_id => 1
+    # to run unauthenticated) must never honour a client-supplied user_id,
+    # otherwise an anonymous caller could impersonate any client.
+    if ( !$p->{user_id} && $user->is_admin && $args{user_id} ) {
         switch_user( $args{user_id} );
-    }
-
-    if ( my $r_args = $p->{required} ) {
-        for ( @{ $r_args } ) {
-            $args{ $_ } = $p->{ $_ } if exists $p->{ $_ };
-            unless ( exists $args{ $_ } ) {
-                print_header( status => 400 );
-                print_json( { error => sprintf("Field required: %s", $_) } );
-                exit 0;
-            }
-        }
+    } else {
+        delete $args{user_id};
     }
 
     my $service = get_service( $p->{controller} );
     unless ( $service ) {
-        print_header( status => 500 );
-        print_json( { error => 'Недоступно в данной версии'} );
+        _log_api_call( $user, code => 404, error => 'Ресурс не найден', descr => $api_descr );
+        print_header( status => 404 );
+        print_json( { error => 'Ресурс не найден'} );
         exit 0;
+    }
+
+    # If params is explicitly defined in route (even as empty {}), use it as-is.
+    # If params is not defined at all, auto-populate from controller structure.
+    my %schema;
+    if ( exists $p->{params} ) {
+        %schema = %{ $p->{params} };
+    } elsif ( $service->can('structure') ) {
+        my $structure = $service->structure;
+        for my $field ( keys %{ $structure } ) {
+            my $type = $structure->{ $field }->{type} // 'string';
+            $type = 'object' if $type eq 'json';
+            $type = 'string' if $type =~ /^(?:text|now|date)$/;
+            $schema{ $field } = { type => $type };
+        }
+    }
+
+    # For GET list_for_api endpoints, inject common list params into schema so
+    # they pass validation and are forwarded to the controller.
+    if ( $ENV{REQUEST_METHOD} eq 'GET' && ( !$p->{method} || $p->{common_params} ) ) {
+        my %_common = (
+            field  => { type => 'string',  pattern => '^\w+' },
+            sort_field => {type => 'string', pattern => '^\w+' },
+            sort_direction => { type => 'enum', enum => ['desc','asc'] },
+            start  => { type => 'string', pattern => '^\d{4}-\d{2}-\d{2}' },
+            stop   => { type => 'string', pattern => '^\d{4}-\d{2}-\d{2}' },
+            limit  => { type => 'integer', min => 0, max => 10000 },
+            offset => { type => 'integer', min => 0 },
+            filter => { type => 'string' },
+        );
+
+        for my $f ( keys %_common ) {
+            $schema{$f} //= $_common{$f};
+        }
     }
 
     my $method = $p->{method};
@@ -718,69 +2498,146 @@ if ( my $p = $router->match( sprintf("%s:%s", $ENV{REQUEST_METHOD}, $uri )) ) {
     $method ||= 'api_add'       if $ENV{REQUEST_METHOD} eq 'PUT';
     $method ||= 'delete'        if $ENV{REQUEST_METHOD} eq 'DELETE';
 
+    my %allowed_input_fields = map { $_ => 1 } (
+        keys %schema,
+        'dry_run',
+        'format',
+        'POSTDATA',
+        'PUTDATA',
+        ( $p->{splat_to} ? $p->{splat_to} : () ),
+    );
+    if ( my $err = validate_params( \%schema, \%args, \%allowed_input_fields ) ) {
+        _log_api_call( $user, code => 400, error => $err, descr => $api_descr );
+        print_header( status => 400 );
+        print_json( { status => 400, error => $err } );
+        get_service('logger')->warning( sprintf("API validation error: %s %s::%s => %s",
+            $ENV{REQUEST_METHOD},
+            ref $service,
+            $method,
+            $err
+        ));
+        exit 0;
+    }
+
+    # Build safe_args: route-level defaults + only declared/validated input fields.
+    # Any %in field not listed in params or optional is silently dropped.
+    # Use %args (not %in) so that type-coerced values (int, number) are used.
+    my %safe_args = (
+        %{ $p->{args} || {} },
+        $admin_mode ? ( admin => $admin_mode ) : (),
+    );
+    # User-provided input only (no route-level defaults like `routes`).
+    # Used for logging to avoid serialising huge internal structures.
+    my %input_args;
+    for my $field ( keys %in ) {
+        if ( $allowed_input_fields{$field} ) {
+            $safe_args{$field}  = $args{$field};
+            $input_args{$field} = $args{$field};
+        }
+    }
+    # Preserve user_id context if admin switched user (already processed above)
+    $safe_args{user_id} = $args{user_id} if $admin_mode && exists $args{user_id};
+
     unless ( $service->can( $method ) ) {
+        _log_api_call( $user, code => 500, args => \%input_args, error => 'Method not exists', descr => $api_descr );
         print_header( status => 500 );
-        print_json( { error => 'Method not exists'} );
+        print_json( { status => 500, error => 'Method not exists'} );
+        exit 0;
+    }
+
+    our $last_cache_reset //= time();
+    our $cache_reset_interval //= 10;
+
+    if ( my $cache = get_service('Core::System::Cache') ) {
+        my $ip = get_user_ip();
+        my $tag = lc sprintf("%s-%s-%s", ref $service, $method, $ip);
+        if ( $cache->get( $tag ) >= 5 ) {
+            get_service('logger')->error("API rejected for tag: $tag");
+            _log_api_call( $user, code => 429, args => \%input_args, error => '429 Too Many Requests', descr => $api_descr );
+            print_header( status => 429 );
+            print_json( { status => 429, error => '429 Too Many Requests', ip => $ip } );
+            exit 0;
+        }
+
+        # Cache reset operations with rate limiting (max 1 per 10 seconds per worker)
+        my $now = time();
+        if ($now - $last_cache_reset >= $cache_reset_interval) {
+            my %resets = $cache->redis->hgetall('SHM:Cache:Reset');
+            for my $item ( keys %resets ) {
+                my $reset_ts = $resets{$item};
+                next if $reset_ts < $last_cache_reset;
+                my $reset_service = get_service( $item ) || next;
+                $reset_service->unregister_child();
+                Core::System::ServiceManager::setup() if $item eq 'Core::Config';
+                get_service('logger')->info("Worker PID=$$ Reset cache for $item");
+            }
+
+            # Always update last check time after interval passes
+            # Set -1 sec to prevent race conditions
+            $last_cache_reset = $now - 1;
+        }
     }
 
     my @data;
     my %headers;
     my %info;
 
+    # Temporary direct disallow `fields`
+    delete $args{fields};
+
     if ( $ENV{REQUEST_METHOD} eq 'GET' ) {
-        @data = $service->$method( %args );
+        @data = $service->$method( %safe_args );
         %info = (
             items => $service->found_rows(),
             limit => $in{limit} || 25,
             offset => $in{offset} || 0,
-            $args{filter} ? (filter => $args{filter}) : (),
+            $safe_args{filter} ? (filter => $safe_args{filter}) : (),
         );
     } elsif ( $ENV{REQUEST_METHOD} eq 'PUT' ) {
-        my $ret = $service->$method( %args );
+        my $ret = $service->$method( %safe_args );
         if ( length $ret ) {
             if ( ref $ret eq 'HASH' ) {
                 push @data, $ret;
             } elsif ( ref $ret eq 'ARRAY' ) {
                 @data = @{ $ret };
+            } elsif ( blessed $ret ) {
+                @data = scalar $ret->get;
             } else {
-                @data = ref $ret ? scalar $ret->get : scalar $service->id( $ret )->get;
+                if ( my $obj = $service->id( $ret ) ) {
+                    @data = scalar $obj->get;
+                } else {
+                    $headers{status} = 409;
+                    $info{error} = "Can't create a service";
+                }
             }
         }
         else {
             $headers{status} = 400;
-            $info{error} = "Can't add new object. Perhaps it already exists?";
+            $info{error} = "Can't add a new object. Perhaps it already exists?";
         }
-    } elsif ( $ENV{REQUEST_METHOD} eq 'POST' ) {
-        if ( $user->id ) {
-            if ( $service = $service->id( get_service_id( $service, %args ) ) ) {
-                if ( $service->lock( timeout => 3 )) {
-                    push @data, $service->$method( %args );
+    } elsif ( $ENV{REQUEST_METHOD} eq 'POST' || $ENV{REQUEST_METHOD} eq 'DELETE' ) {
+        if ( $user->id && $service->can('structure') ) {
+            if ( $service = $service->id( get_service_id( $service, %safe_args ) ) ) {
+                if ( !$admin_mode && $user->id != $service->user_id ) {
+                    $headers{status} = 404;
+                    $info{error} = "Object not found. Check the ID.";
                 } else {
-                    $headers{status} = 408;
-                    $info{error} = "The service is locked. Try again later.";
+                    if ( $service->lock( timeout => 3 )) {
+                        push @data, $service->$method( %safe_args );
+                    } else {
+                        $headers{status} = 408;
+                        $info{error} = "The service is locked. Try again later.";
+                    }
                 }
             } else {
                 $headers{status} = 404;
-                $info{error} = "Can't get a service. Check the ID.";
+                $info{error} = "Object not found. Check the ID.";
             }
         } elsif ( $service->can( $method ) ) {
-            push @data, $service->$method( %args );
+            push @data, $service->$method( %safe_args );
         } else {
             $headers{status} = 400;
             $info{error} = "Unknown error";
-        }
-    } elsif ( $ENV{REQUEST_METHOD} eq 'DELETE' ) {
-        if ( my $obj = $service->id( get_service_id( $service, %args ) ) ) {
-            if ( $obj->lock( timeout => 3 )) {
-                push @data, $obj->$method( %args );
-                $headers{status} = 200;
-            } else {
-                $headers{status} = 408;
-                $info{error} = "The service is locked. Try again later.";
-            }
-        } else {
-            $headers{status} = 404;
-            $info{error} = "Service not found";
         }
     } else {
             $headers{status} = 400;
@@ -788,15 +2645,22 @@ if ( my $p = $router->match( sprintf("%s:%s", $ENV{REQUEST_METHOD}, $uri )) ) {
     };
 
     my $report = get_service('report');
-    unless ( $report->is_success ) {
-        print_header( status => 400 );
+    unless ( $report->is_success || $p->{skip_errors} ) {
+        my %headers = $report->headers;
+        $headers{status} ||= 400;
         my ( $err_msg ) = $report->errors;
-        print_json( { error => $err_msg } );
+        _log_api_call( $user, code => $headers{status}, args => \%input_args, error => $err_msg, descr => $api_descr );
+        print_header( %headers );
+        print_json( { status => $headers{status}, error => $err_msg } );
         exit 0;
     }
 
-    if ( $args{format} eq 'plain' || $args{format} eq 'html' ) {
-        print_header( %headers, type => "text/$args{format}" );
+    if ( $service ) {
+        $service->remove_protected_fields( \@data, admin => $user->is_admin );
+    }
+
+    if ( $safe_args{format} eq 'plain' || $safe_args{format} eq 'html' ) {
+        print_header( %headers, type => "text/$safe_args{format}" );
         for ( @data ) {
             unless ( ref ) {
                 utf8::encode($_);
@@ -805,7 +2669,7 @@ if ( my $p = $router->match( sprintf("%s:%s", $ENV{REQUEST_METHOD}, $uri )) ) {
                 print encode_json( $_ );
             }
         }
-    } elsif ( $args{format} eq 'json' ) {
+    } elsif ( $safe_args{format} eq 'json' ) {
         print_header( %headers, type => "application/json" );
         for ( @data ) {
             unless ( ref ) {
@@ -815,10 +2679,10 @@ if ( my $p = $router->match( sprintf("%s:%s", $ENV{REQUEST_METHOD}, $uri )) ) {
                 print encode_json( $_ );
             }
         }
-    } elsif ( $args{format} eq 'other' ) {
+    } elsif ( $safe_args{format} eq 'other' ) {
         print_header( %headers,
             type => 'application/octet-stream',
-            $args{filename} ? ('Content-Disposition' => "attachment; filename=$args{filename}") : (),
+            $safe_args{filename} ? ('Content-Disposition' => "attachment; filename=$safe_args{filename}") : (),
         );
         for ( @data ) {
             unless ( ref ) {
@@ -828,40 +2692,47 @@ if ( my $p = $router->match( sprintf("%s:%s", $ENV{REQUEST_METHOD}, $uri )) ) {
                 print encode_json( $_ );
             }
         }
-    } elsif ( $args{format} eq 'qrcode' ) {
+    } elsif ( $safe_args{format} eq 'qrcode' ) {
         print_header( %headers,
             type => 'image/svg+xml',
         );
         my $data = join('', @data);
-        my $output = qx(echo "$data" | qrencode -t svg);
-        print $output;
-    } elsif ( $args{format} eq 'qrcode_png' ) {
+        my $result = qrencode($data, format => 'SVG');
+        print $result->{data} if $result->{success};
+    } elsif ( $safe_args{format} eq 'qrcode_png' ) {
         print_header( %headers,
             type => 'image/png',
         );
         my $data = join('', @data);
-        my $output = qx(echo "$data" | qrencode -t PNG -o -);
-        print $output;
+        my $result = qrencode($data, format => 'PNG');
+        print $result->{data} if $result->{success};
+    } elsif ( $info{error} ) {
+        print_header( %headers );
+        print_json({
+            %info,
+            status => $headers{status},
+        });
     } else {
         print_header( %headers );
         print_json({
             TZ => $ENV{TZ},
-            version => get_service('config')->id( '_shm' )->get_data->{'version'},
             date => scalar localtime,
             %info,
             data => \@data,
+            status => 200,
         });
     }
 
+    _log_api_call( $user, code => $headers{status}, args => \%input_args, descr => $api_descr, error => $info{error} );
     if ( $in{dry_run} ) {
         $user->rollback();
     } else {
         $user->commit();
     }
-    $user->dbh->disconnect();
 } else {
+    _log_api_call( undef, code => 404 );
     print_header( status => 404 );
-    print_json( { error => 'Method not found'} );
+    print_json( { status => 404, error => 'Method not found'} );
 }
 
 sub get_service_id {
@@ -877,10 +2748,139 @@ sub get_service_id {
 
     unless ( length $service_id ) {
         print_header( status => 400 );
-        print_json( { error => sprintf("`%s` not present", $service->get_table_key ) } );
+        print_json( { status => 400, error => sprintf("`%s` not present", $service->get_table_key ) } );
         exit 0;
     }
-    return $service_id;
+
+    my $key2 = $service->get_table_key2;
+    if ( $key2 && exists $args{ $key2 } ) {
+        return ( $service_id, $args{ $key2 } );
+    }
+
+    return ( $service_id );
 }
 
-exit 0;
+# Validate %args against a params schema defined in the route.
+# Schema format (per field):
+#   type         => 'integer' | 'number' | 'string' | 'email' | 'boolean' | 'object' | 'array'
+#   required     => 1   (field must be present and non-empty)
+#   min / max    => numeric bounds (for integer/number)
+#   min_length   => minimum string length
+#   max_length   => maximum string length
+#   pattern      => regex the value must match (string)
+#   enum         => arrayref of allowed values
+#
+# Returns undef on success, or an error string on the first failing field.
+sub validate_params {
+    my ( $schema, $args, $allowed_input_fields ) = @_;
+
+    for my $field ( sort keys %{ $schema } ) {
+        my $rule  = $schema->{ $field };
+        my $value = $args->{ $field };
+        my $type  = $rule->{type} // 'string';
+
+        # presence check
+        if ( $rule->{required} && ( !defined $value || $value eq '' ) ) {
+            return sprintf( "Field required: %s", $field );
+        }
+
+        # Skip remaining checks only when field is truly absent.
+        # Empty string is treated as provided value and must be validated.
+        next unless defined $value;
+
+        # type coercion / check
+        if ( $type eq 'integer' ) {
+            return sprintf( "Field '%s' must be an integer", $field )
+                unless $value =~ /^-?\d+$/;
+            $value = int($value);
+            $args->{ $field } = $value;
+            return sprintf( "Field '%s' must be >= %s", $field, $rule->{min} )
+                if defined $rule->{min} && $value < $rule->{min};
+            return sprintf( "Field '%s' must be <= %s", $field, $rule->{max} )
+                if defined $rule->{max} && $value > $rule->{max};
+        }
+        elsif ( $type eq 'number' ) {
+            return sprintf( "Field '%s' must be a number", $field )
+                unless $value =~ /^-?(?:\d+\.?\d*|\.\d+)$/;
+            $value = $value + 0;
+            $args->{ $field } = $value;
+            return sprintf( "Field '%s' must be >= %s", $field, $rule->{min} )
+                if defined $rule->{min} && $value < $rule->{min};
+            return sprintf( "Field '%s' must be <= %s", $field, $rule->{max} )
+                if defined $rule->{max} && $value > $rule->{max};
+        }
+        elsif ( $type eq 'boolean' ) {
+            # Normalize JSON booleans (true → 1, false → 0) and string variants
+            if ( ref $value ) {
+                $value = $value ? 1 : 0;
+                $args->{ $field } = $value;
+            } elsif ( $value eq 'true' || $value eq 'false' ) {
+                $value = $value eq 'true' ? 1 : 0;
+                $args->{ $field } = $value;
+            }
+            return sprintf( "Field '%s' must be 0 or 1", $field )
+                unless $value =~ /^[01]$/;
+        }
+        elsif ( $type eq 'email' ) {
+            return sprintf( "Field '%s' must be a valid email address", $field )
+                unless is_email($value) && length($value) <= 254;
+        }
+        elsif ( $type eq 'object' ) {
+            return sprintf( "Field '%s' must be an object", $field )
+                unless ref($value) eq 'HASH';
+        }
+        elsif ( $type eq 'array' ) {
+            return sprintf( "Field '%s' must be an array", $field )
+                unless ref($value) eq 'ARRAY';
+        }
+        elsif ( $type eq 'string' ) {
+            if ( defined $rule->{min_length} && length($value) < $rule->{min_length} ) {
+                return sprintf( "Field '%s' must be at least %d characters", $field, $rule->{min_length} );
+            }
+            if ( defined $rule->{max_length} && length($value) > $rule->{max_length} ) {
+                return sprintf( "Field '%s' must be at most %d characters", $field, $rule->{max_length} );
+            }
+            if ( defined $rule->{pattern} && $value !~ /$rule->{pattern}/ ) {
+                return sprintf( "Field '%s' has an invalid format", $field );
+            }
+        }
+
+        # enum check (applicable to any type)
+        if ( my $enum = $rule->{enum} ) {
+            my %allowed = map { $_ => 1 } @{ $enum };
+            return sprintf( "Field '%s' must be one of: %s", $field, join(', ', @{ $enum }) )
+                unless $allowed{ $value };
+        }
+    }
+
+    return undef;
+}
+
+sub _log_api_call {
+    my $self = shift;
+    my %args = (
+        code => 200,
+        args => {},
+        descr => undef,
+        error => undef,
+        @_,
+    );
+
+    unless ( $self ) {
+        $self = SHM->new( skip_check_auth => 1 );
+    }
+
+    my $logs = $self->srv('Logs::Api') || return;
+
+    return $logs->add(
+        url => $ENV{PATH_INFO},
+        method => $ENV{REQUEST_METHOD},
+        ip => get_user_ip(),
+        duration => int( (Time::HiRes::time() - $request_start) * 1000 ),
+        response_code => delete $args{code} // 200,
+        response_error => delete $args{error},
+        %args,
+    );
+}
+
+# exit 0;

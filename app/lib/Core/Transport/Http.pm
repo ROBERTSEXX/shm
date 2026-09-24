@@ -11,10 +11,18 @@ use Core::Utils qw(
     decode_json
     encode_utf8
 );
-use LWP::UserAgent ();
+use HTTP::Request::Common qw(
+    GET
+    POST
+    PUT
+    DELETE
+    PATCH
+    OPTIONS
+);
 use URI;
 use URI::QueryParam;
 use CGI;
+use LWP::UserAgent;
 
 sub send {
     my $self = shift;
@@ -52,7 +60,7 @@ sub send {
     );
 
     my $method = lc( $settings{method} ) || 'post';
-    unless ( $method =~ /^(get|post|put|delete)$/ ) {
+    unless ( $method =~ /^(get|post|put|delete|patch|options)$/ ) {
         return undef, {error => "unknown method `$method`"};
     }
 
@@ -117,8 +125,42 @@ sub send {
 
 sub HTTP::Response::json_content {
     my $self = shift;
-    return decode_json( $self->decoded_content ) if $self->header('content-type') =~ m/application\/json/gi;
-    return undef;
+    return undef unless $self->header('content-type') =~ m/application\/json/gi;
+    return decode_json( $self->decoded_content );
+}
+
+sub lwp {
+    my $self = shift;
+    my %args = (
+        timeout => 10,
+        keep_alive => 4,
+        verify_hostname => 1,
+        @_,
+    );
+
+    my $http_proxy  = $ENV{HTTP_PROXY}  || $ENV{http_proxy}  || '';
+    my $https_proxy = $ENV{HTTPS_PROXY} || $ENV{https_proxy} || '';
+    my $no_proxy    = $ENV{NO_PROXY}    || $ENV{no_proxy}    || '';
+
+    state %ua_cache;
+    my $cache_key = join('|', $args{timeout}, $args{verify_hostname} // 0, $http_proxy, $https_proxy, $no_proxy);
+
+    return $ua_cache{$cache_key} //= do {
+        my $ua = LWP::UserAgent->new(
+            agent => 'SHM',
+            timeout => $args{timeout},
+            keep_alive => $args{keep_alive},
+            ssl_opts => {
+                verify_hostname => $args{verify_hostname},
+            },
+        );
+        $ua->proxy('http',  $http_proxy)  if $http_proxy;
+        $ua->proxy('https', $https_proxy) if $https_proxy;
+        if ( $no_proxy ) {
+            $ua->no_proxy( split /\s*,\s*/, $no_proxy );
+        }
+        $ua;
+    };
 }
 
 sub http {
@@ -131,22 +173,24 @@ sub http {
         content => '',
         verify_hostname => 1,
         timeout => 10,
+        keep_alive => 4,
+        binary => 0,
         @_,
     );
 
     $args{content_type} ||= 'application/json; charset=utf-8';
 
-    my $method = lc( $args{method} );
+    my $method = uc $args{method};
 
-    my $ua = LWP::UserAgent->new(
-        agent => 'SHM',
-        timeout => $args{timeout},
-        ssl_opts => {
-            verify_hostname => $args{verify_hostname},
-        },
+    my $ua = $self->lwp(
+        %args{ qw(
+            timeout
+            keep_alive
+            verify_hostname
+        ) }
     );
 
-    if ($method eq 'get') {
+    if ($method eq 'GET') {
         my $uri = URI->new($args{url});
         my %q = CGI->new($args{content})->Vars();
         $uri->query_param_append($_, $q{$_}) for keys %q;
@@ -154,27 +198,47 @@ sub http {
     }
 
     my $content = $args{content};
-    if ( ref $content ) {
+    if ( ref $content && $args{content_type} !~ /form-data/i ) {
         $content = encode_json( $content );
     }
 
-    my $response = $ua->$method(
+    my $request_content = ref $content ? $content : encode_utf8( $content );
+
+    no strict 'refs';
+    my $response = $ua->request( &{$method}(
         $args{url},
         Content_Type => $args{content_type},
-        Content => encode_utf8( $content ),
+        Content => $request_content,
         %{ $args{headers} || {} },
-    );
+    ));
+
+    $self->{response} = $response;
 
     logger->dump( $response->request );
 
+    # Декодирование UTF-8 для текстового контента
+    if (!$args{binary}) {
+        my $content = $response->decoded_content;
+        if (!utf8::is_utf8($content)) {
+            utf8::decode($content);
+            # Заменяем контент в response объекте
+            $response->{_content} = $content;
+        }
+    }
+
     return $response;
 }
+
+sub response { shift->{response} };
 
 sub _http {
     my $self = shift;
     my $method = shift;
     my $url = shift;
-    my %args = @_;
+    my %args = (
+        binary => 0,
+        get_smart_args( @_ ),
+    );
 
     my $response = $self->http(
         method => $method,
@@ -182,12 +246,23 @@ sub _http {
         %args,
     );
 
-    return $response->json_content || $response->decoded_content;
+    if ($args{full_response}) {
+        return {
+            http_headers     => { $response->headers->flatten },
+            http_code        => $response->code,
+            http_status_line => $response->status_line,
+            body             => $args{binary} ? $response->content : ($response->json_content || $response->decoded_content),
+        };
+    } else {
+        return $args{binary} ? $response->content : ($response->json_content || $response->decoded_content);
+    }
 }
 
 sub get { return shift->_http( 'get', @_ ) }
 sub put { return shift->_http( 'put', @_ ) }
 sub post { return shift->_http( 'post', @_ ) }
 sub delete { return shift->_http( 'delete', @_ ) }
+sub patch { return shift->_http( 'patch', @_ ) }
+sub options { return shift->_http( 'options', @_ ) }
 
 1;

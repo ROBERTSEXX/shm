@@ -12,7 +12,9 @@ use POSIX ":sys_wait_h";
 use POSIX 'setsid';
 use Core::Utils qw(
     html_escape
+    html_unescape
     is_host
+    encode_utf8
 );
 
 sub events {
@@ -41,6 +43,7 @@ sub send {
         %server,
         %{ $server{settings} },
         %{ $task->event_settings },
+        %{ $task->settings },
         task => $task,
         $task->settings->{user_service_id} ? ( usi => $task->settings->{user_service_id} ) : (),
     );
@@ -52,7 +55,7 @@ sub exec {
     my $self = shift;
     my %args = (
         host => undef,
-        port => 22,
+        port => undef,
         key_id => undef,
         server_id => undef,
         timeout => 10,
@@ -66,13 +69,33 @@ sub exec {
         shell => $ENV{SHM_TEST} ? 'echo' : undef,
         stderr_to_stdout => 1,
         proxy_jump => undef,
-        @_,
+        get_smart_args( @_ ),
     );
 
     my $event_name = $args{event_name};
     if ( $args{task} && $args{task}->event ) {
         $event_name //= $args{task}->event->{name};
     }
+
+    if ( my $server_id = $args{server_id} ) {
+        my $server = get_service('server', _id => $server_id );
+        unless ( $server ) {
+            get_service('report')->add_error("Server not found: $server_id");
+            return undef, {
+                error => "Server not found: $server_id",
+            };
+        }
+
+        my %server = $server->get;
+        my $settings = $server{settings} || {};
+
+        $args{host} //= $server{host};
+        $args{port} //= $settings->{port};
+        $args{template_id} //= $settings->{template_id} unless $args{cmd};
+        $args{key_id} //= $settings->{key_id};
+    }
+
+    $args{port} //= 22;
 
     my $host = get_ssh_host( $args{host} );
     unless ( $host ) {
@@ -128,8 +151,14 @@ sub exec {
     $args{pipeline_id} //= get_service('console')->new_pipe;
 
     my $console = get_service('console', _id => $args{pipeline_id} );
+    unless ( $console ) {
+        get_service('report')->add_error("Console not found: $args{pipeline_id}");
+        return undef, {
+            error => "Console not found: $args{pipeline_id}",
+        };
+    }
 
-    my $host_msg = "Trying connect to: $host";
+    my $host_msg = "Trying connect to: $host (timeout: $args{timeout}s)";
     $host_msg .= " port $args{port}";
     $host_msg .= " through $proxy_jump" if $proxy_jump;
 
@@ -146,6 +175,11 @@ sub exec {
     }
 
     $Net::OpenSSH::debug = ~0 if $ENV{DEBUG} eq 'DEBUG';
+
+    open my $stdin_null_fh, '<', '/dev/null' or return undef, {
+        error => "Can't open /dev/null for STDIN: $!",
+    };
+    local *STDIN = $stdin_null_fh;
 
     my $ret_code;
     my $ssh = Net::OpenSSH->new(
@@ -165,7 +199,7 @@ sub exec {
     unlink $key_file;
 
     if ( $ssh->error ) {
-        logger->error( $ssh->error );
+        logger->warning( $ssh->error );
         $console->append("<font color=red>FAIL\n".$ssh->error."</font>\n");
         $ret_code = -1;
     } else {
@@ -187,13 +221,22 @@ sub exec {
         ) or die "pipe_out method failed: " . $ssh->error;
 
         if ( $args{stdin} ) {
-            print $in $args{stdin};
+            print $in encode_utf8( $args{stdin} );
             close $in;
         }
 
-        while (<$rout>) {
-            $out .= $_;
-            $console->append( html_escape($_) );
+        eval {
+            local $SIG{ALRM} = sub { die "timeout\n" };
+            alarm($args{timeout} || 10);
+            while (<$rout>) {
+                $out .= $_;
+                $console->append( html_escape($_) );
+            }
+            alarm(0);
+        };
+        if ($@ && $@ eq "timeout\n") {
+            kill 'TERM', $ssh_pid if $ssh_pid;
+            $console->append('<font color="red">TIMEOUT</font><br/>');
         }
         close $rout;
 
@@ -202,7 +245,7 @@ sub exec {
     }
 
     if ( $ret_code ) {
-        logger->error("ERROR: $ret_code");
+        logger->warning("ERROR: $ret_code");
         $console->append('<font color="red">ERROR '. $ret_code .'</font>');
     }
     else {
@@ -216,9 +259,12 @@ sub exec {
         logger->debug("SSH RET_CODE: $ret_code");
     }
     elsif ( defined $ret_code ) {
-        logger->error("SSH CMD: $args{cmd}" ) if $args{cmd};
-        logger->error("SSH RET_CODE: $ret_code");
+        logger->warning("SSH CMD: $args{cmd}" ) if $args{cmd};
+        logger->warning("SSH RET_CODE: $ret_code");
     }
+
+    $self->{pipeline_id} = $args{pipeline_id};
+    $self->{ret_code} = $ret_code;
 
     $ret_code //= 0;
     return ( $ret_code == 0 ) ? SUCCESS : FAIL, {
@@ -232,6 +278,41 @@ sub exec {
         ret_code => $ret_code,
         pipeline_id => $args{pipeline_id},
     };
+}
+
+sub logs {
+    my $self = shift;
+    my $pipeline_id = shift || $self->{pipeline_id};
+
+    unless ( $pipeline_id ) {
+        logger->error('pipeline_id is required');
+        return undef;
+    }
+
+    my $console = get_service('console', _id => $pipeline_id );
+    unless ( $console ) {
+        logger->error("Logs not found for id: $pipeline_id");
+        return undef;
+    }
+
+    return $console->reload->{log};;
+}
+
+sub output {
+    my $self = shift;
+    my $pipeline_id = shift || $self->{pipeline_id};
+
+    my $logs = $self->logs( $pipeline_id );
+    $logs =~ s/\A[^\n]*\n+//;   # remove first line + trailing blank lines
+    $logs =~ s/\n+[^\n]*\z//;   # remove last line + leading blank lines
+    return html_unescape( $logs );
+}
+
+sub ret_code { shift->{ret_code} };
+
+sub is_success {
+    my $self = shift;
+    return $self->ret_code == 0 ? 1 : 0;
 }
 
 sub ssh_test {
@@ -268,6 +349,7 @@ sub ssh_init {
         template_id => undef,
         event_name => 'init',
         pipeline_id => get_service('console')->new_pipe,
+        timeout => 600, # long time for init
         @_,
     };
 

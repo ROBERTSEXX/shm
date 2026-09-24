@@ -14,10 +14,11 @@ our @EXPORT = qw(
     process_service_recursive
     money_back
     calc_withdraw
+    switch_to_next_service
 );
 
 use Core::Const;
-use Core::Utils qw(now string_to_utime utime_to_string start_of_month end_of_month parse_date days_in_months);
+use Core::Utils qw(now string_to_utime utime_to_string start_of_month end_of_month parse_date days_in_months round);
 use Time::Local 'timelocal_nocheck';
 
 use base qw( Core::System::Service );
@@ -40,9 +41,9 @@ sub create_service {
         @_,
     );
 
-    my $us = create_service_recursive( %args );
+    my $us = create_service_recursive( %args ) || return undef;
 
-    return process_service_recursive( $us, EVENT_CREATE );
+    return $us->get_auto_bill ? process_service_recursive( $us, EVENT_CREATE ) : $us;
 }
 
 sub create_service_recursive {
@@ -72,9 +73,13 @@ sub create_service_recursive {
     if ( $service->get_pay_always || !$args{parent} ) {
         my %srv = $service->get;
         my $wd_id = add_withdraw(
+            $us,
             calc_withdraw( $us->billing, %srv, %args ),
-            user_service_id => $us->id,
         );
+        unless ( $wd_id ) {
+            logger->error( "Failed to add withdraw for user service: " . $us->id );
+            return undef;
+        }
         $us->set( withdraw_id => $wd_id );
     }
 
@@ -89,16 +94,18 @@ sub create_service_recursive {
 sub process_service_recursive {
     my $service = shift;
     my $event = shift || EVENT_PROLONGATE;
+    my %args = @_;
 
-    if ( $event = process_service( $service, $event ) ) {
+    return undef unless ref $service;
+
+    if ( $event = process_service( $service, $event, %args ) ) {
+        logger->info('Process service: '. $service->id . ", Result: [$event]" );
         for my $child ( @{$service->children} ) {
             process_service_recursive(
                 $service->id( $child->id ),
                 $event,
+                %args,
             );
-        }
-        if ( $event eq EVENT_PROLONGATE ) {
-            $event = $service->get_status eq STATUS_BLOCK ? EVENT_ACTIVATE : EVENT_PROLONGATE;
         }
         $service->event( $event );
     }
@@ -115,11 +122,17 @@ sub process_service_recursive {
 sub process_service {
     my $self = shift;
     my $event = shift;
+    my %args = @_;
 
-    logger->info('Process service: '. $self->id . " Event: [$event]" );
+    logger->info('Process service: '. $self->id . ", Event: [$event]" );
 
     if ( $self->get_status eq STATUS_PROGRESS ) {
-        logger->debug('Service in progress. Skipping...');
+        logger->info('Service in progress. Skipping...');
+        return undef;
+    }
+
+    if ( $self->get_status eq STATUS_REMOVED ) {
+        logger->warning('Service is removed. Skipping...');
         return undef;
     }
 
@@ -128,9 +141,9 @@ sub process_service {
         return $event;
     }
 
-    if ( $event eq EVENT_BLOCK ) {
+    if ( $event eq EVENT_BLOCK_FORCE ) {
         return block( $self );
-    } elsif ( $event eq EVENT_ACTIVATE ) {
+    } elsif ( $event eq EVENT_ACTIVATE_FORCE ) {
         return activate( $self );
     } elsif ( $event eq EVENT_REMOVE ) {
         return remove( $self );
@@ -138,25 +151,26 @@ sub process_service {
 
     unless ( $self->get_expire ) {
         # Новая услуга
-        logger->debug('New service');
+        logger->info('New service');
         return create( $self );
     }
 
     unless ( $self->has_expired ) {
         # Услуга не истекла
         # Ничего не делаем с этой услугой
+        logger->info('Service is not expired. Skipping...');
         return undef;
     }
 
-    # Продляем услугу
-    return prolongate( $self );
+    return prolongate( $self, %args );
 }
 
 sub add_withdraw {
+    my $us = shift;
     my %wd = @_;
 
-    delete @wd{ qw/ withdraw_id create_date end_date withdraw_date / };
-    return get_service('withdraw')->add( %wd );
+    delete @wd{ qw/ withdraw_id create_date end_date withdraw_date user_service_id / };
+    return $us->srv('wd', usi => $us->id )->add( %wd );
 }
 
 # Создание следущего платежа на основе текущего
@@ -172,7 +186,12 @@ sub add_withdraw_next {
         bonus => 0,
     );
 
-    return add_withdraw( %wd );
+    # Если денег не хватает и установлен флаг продления на всю сумму, то вычисляем wd здесь
+    if ( $self->service->settings->{allow_partial_period} ) {
+        apply_partial_period( $self, \%wd, $self->service->get_period );
+    }
+
+    return add_withdraw( $self, %wd );
 }
 
 # Вычисляет итоговую стоимость услуги
@@ -181,7 +200,7 @@ sub calc_withdraw {
     my $billing = shift;
     my %wd = (
         cost => undef,
-        months => 1,
+        months => undef,
         discount => 0,
         qnt => 1,
         @_,
@@ -190,6 +209,7 @@ sub calc_withdraw {
     $wd{qnt} = 1 if $wd{qnt} < 1;
 
     my %service = get_service( 'service', _id => $wd{service_id} )->get;
+    $wd{months} ||= $wd{period};
     %wd = ( %service, %wd );
 
     $wd{withdraw_date}||= now;
@@ -204,13 +224,58 @@ sub calc_withdraw {
     $wd{discount}||= get_service_discount( %wd );
     $wd{discount} = 0 if $service{no_discount};
 
-    $wd{total} = sprintf("%.2f", ( $wd{total} - $wd{total} * $wd{discount} / 100 ) * $wd{qnt} );
+    $wd{total} = round( ( $wd{total} - $wd{total} * $wd{discount} / 100 ) * $wd{qnt} );
 
     $wd{total} -= $wd{bonus};
 
     return %wd;
 }
 
+# принимает сумму в качестве аргумента
+# вычисляет доступные бонусы
+# проверяет возможность оплаты списания (баланс, бонусы, скидки и т.п.)
+# возвращает структуру в случае успеха: деньги и бонусы, 0 - в случае нехватки средств
+sub calc_payment {
+    my $self  = shift;
+    my $total = shift;
+
+    my $user  = $self->user;
+    my $bonus = calc_available_bonuses( $self->service, $user->get_bonus, $total );
+
+    my $check_total = $total;
+    my $root = $self->top_parent;
+    if ( $root->service->get_is_composite ) {
+        if ( $self->id == $root->id ) {
+            # I'm a root
+            $check_total = $self->wd_total_composite;
+        } else {
+            # I'm a child
+            return 0 unless $root->is_paid;
+        }
+    }
+
+    # Not enough money
+    return 0 if (
+                    $check_total > 0 &&
+                    $user->get_balance + $user->get_credit + $bonus < $check_total &&
+                    !$user->get_can_overdraft &&
+                    !$self->get_pay_in_credit );
+
+    if ( $bonus >= $total ) {
+        $bonus = $total;
+        $total = 0;
+    } else {
+        $total -= $bonus;
+    }
+
+    return {
+        bonus => $bonus,
+        total => $total,
+    };
+}
+
+# метод пробует оплатить списание
+# списывает деньги и бонусы с баланса и возвращает статус
 sub is_pay {
     my $self = shift;
 
@@ -226,46 +291,15 @@ sub is_pay {
     # Already withdraw
     return 1 if $wd->get_withdraw_date;
 
-    my $user = $self->user;
-    my $balance = $user->get_balance + $user->get_credit;
-    my $bonus = $user->get_bonus;
-    my $total = $wd->get_total;
+    my $pay = calc_payment( $self, $wd->get_total ) or return 0;
+    my ( $bonus, $total ) = @{$pay}{qw( bonus total )};
 
-    my $root = $self->top_parent;
-    if ( $root->service->get_is_composite ) {
-        if ( $self->id == $root->id ) {
-            # I'm a root
-            $total = $self->wd_total_composite;
-        } else {
-            # I'm a child
-            return 0 unless $root->is_paid;
-        }
-    }
-
-    # Not enough money
-    return 0 if (
-                    $total > 0 &&
-                    $balance + $bonus < $total &&
-                    !$user->get_can_overdraft &&
-                    !$self->get_pay_in_credit );
-
-    # refresh total after composite services
-    $total = $wd->get_total;
-
-    if ( $bonus >= $total ) {
-        $bonus = $total;
-        $total = 0;
-    } else {
-        $total -= $bonus;
-    }
-
-    $user->set_bonus( bonus => -$bonus, comment => { withdraw_id => $wd->id } );
-    $user->set_balance( balance => -$total );
-    #$user->add_bonuses_for_partners( $total );
+    $self->user->set_bonus( bonus => -$bonus, comment => { withdraw_id => $wd->id } );
+    $self->user->set_balance( balance => -$total );
 
     $wd->set(
-        bonus => $bonus,
-        total => $total,
+        bonus         => $bonus,
+        total         => $total,
         withdraw_date => now,
     );
 
@@ -319,71 +353,128 @@ sub create {
 
 sub prolongate {
     my $self = shift;
+    my %args = (
+        force => 0,
+        allow_partial_period => 0,
+        @_,
+    );
 
     logger->info('Trying to prolong the service: ' . $self->id );
 
-    if ( $self->parent_has_expired ) {
-        # Не продлеваем услугу если родитель истек
-        logger->debug('Parent has expired. Skipped');
+    unless (    $self->get_status eq STATUS_ACTIVE ||
+                $self->get_status eq STATUS_WAIT_FOR_PAY ||
+                $self->get_status eq STATUS_BLOCK
+    ) {
+        logger->warning( sprintf "Can't prolongate service %d with status: %s . Skipped", $self->id, $self->get_status );
+        return undef;
+    }
+
+    if ( $self->service->no_auto_renew && !$args{force} ) {
+        logger->debug( sprintf "Block service because of `no_auto_renew` is set for usi %d", $self->id );
         return block( $self );
     }
 
-    # TODO: make_service_act
-    # TODO: backup service
+    unless ( $self->has_expired ) {
+        logger->info("Service has not expired. Skipped");
+        return undef;
+    }
 
-    if ( $self->get_next == -1 ) {
-        # Удаляем услугу
+    if ( $self->parent_has_expired ) {
+        # Не продлеваем услугу если родитель истек
+        logger->info('Parent has expired. Skipped');
+        return block( $self );
+    }
+
+    if ( $self->withdraw->paid && $self->get_next == -1 ) {
         return remove( $self );
-    }
-    elsif ( my $new_service_id = $self->get_next ) {
-        # Change service to new
-        my $service = get_service('service', _id => $new_service_id );
-        logger->fatal( "Service not exists: $new_service_id" ) unless $service;
-
-        my %srv = $service->get;
-        my $wd_id = add_withdraw(
-            calc_withdraw(
-                $self->billing,
-                %srv,
-                months => $service->get_period,
-                discont => 0,
-            ),
-            user_service_id => $self->id,
-        );
-
-        $self->set(
-            service_id => $service->id,
-            next => $service->get_next,
-            withdraw_id => $wd_id,
-        );
-        $self->make_commands_by_event( EVENT_CHANGED_TARIFF );
-    }
-
-    # Для существующей услуги используем текущее/следующее/новое списание
-    my $wd_id = $self->get_withdraw_id;
-    my $wd = $wd_id ? get_service('wd', _id => $wd_id ) : undef;
-
-    if ( $wd && $wd->get_withdraw_date ) {
-        if ( my %next = $self->withdraw->next ) {
-            $wd_id = $next{withdraw_id};
-        } else {
-            $wd_id = add_withdraw_next( $self );
+    } elsif ( $self->withdraw->paid && $self->get_next ) {
+        unless (switch_to_next_service( $self, %args )) {
+            logger->error( "Failed to switch to next service for user service: " . $self->id );
+            return undef;
         }
-        $self->set( withdraw_id => $wd_id );
+    } elsif ( $self->withdraw->paid ) {
+        # Для существующей услуги используем текущее/следующее/новое списание
+        my $wd = $self->withdraw;
+        if ( $wd && $wd->get_withdraw_date ) {
+            my $wd_id;
+            if ( my %next = $self->withdraw->next ) {
+                $wd_id = $next{withdraw_id};
+            } else {
+                $wd_id = add_withdraw_next( $self );
+                unless ( $wd_id ) {
+                    logger->error( "Failed to add withdraw for user service: " . $self->id );
+                    return undef;
+                }
+            }
+            $self->set( withdraw_id => $wd_id );
+        }
     }
 
     unless ( is_pay( $self ) ) {
         logger->info('Not enough money');
-        return block( $self );
+        return $self->get_status eq STATUS_BLOCK ? undef : block( $self );
     }
 
     set_service_expire( $self );
-    return EVENT_PROLONGATE;
+
+    return EVENT_ACTIVATE if $self->get_status eq STATUS_WAIT_FOR_PAY || $self->get_status eq STATUS_BLOCK;
+    return EVENT_PROLONGATE if $self->get_status eq STATUS_ACTIVE;
+    return undef;
+}
+
+sub switch_to_next_service {
+        my $us = shift;
+        my %args = (
+            allow_partial_period => 0,
+            @_,
+        );
+
+        my $new_service_id = $us->get_next;
+        unless ( $new_service_id ) {
+            logger->warning( "Next service not exists for user service: " . $us->id );
+            return;
+        }
+
+        my $service = get_service('service', _id => $new_service_id );
+        unless ( $service ) {
+            logger->warning( "Service not exists: $new_service_id" );
+            return;
+        }
+
+        my %wd = calc_withdraw( $us->billing, $service->get );
+        delete @wd{ qw/ create_date end_date withdraw_date user_service_id / };
+
+        if ( $args{allow_partial_period} || $service->settings->{allow_partial_period} ) {
+            apply_partial_period( $us, \%wd, $service->get_period );
+        }
+
+        my $wd_id;
+        my $wd = $us->withdraw;
+        if ( $wd->unpaid ) {
+            $wd->set( %wd );
+        } else {
+            $wd_id = add_withdraw(
+                $us,
+                %wd,
+            );
+            unless ($wd_id) {
+                logger->error( "Failed to add withdraw for user service: " . $us->id );
+                return;
+            }
+        }
+
+        $us->set(
+            service_id => $service->id,
+            next => $service->get_next,
+            $wd_id ? ( withdraw_id => $wd_id ) : (),
+        );
+        $us->make_commands_by_event( EVENT_CHANGED_TARIFF );
+        return 1;
 }
 
 sub block {
     my $self = shift;
-    return 0 unless $self->get_status eq STATUS_ACTIVE;
+    return 0 if $self->get_status ne STATUS_ACTIVE;
 
     return EVENT_BLOCK;
 }
@@ -397,6 +488,7 @@ sub activate {
 
 sub remove {
     my $self = shift;
+    return 0 if $self->get_status eq STATUS_REMOVED;
 
     money_back( $self );
 
@@ -437,55 +529,164 @@ sub money_back {
     return undef unless $self->get_withdraw_id;
 
     my $service = get_service('service', _id => $self->get_service_id );
+    return undef unless $service;
     return undef if $service->settings->{no_money_back};
 
     my $wd = $self->withdraw;
     return undef unless $wd;
 
-    my %wd = ( $service->get, $wd->get );
+    my %wd = $wd->get;
     return undef unless $wd{end_date};
     return undef if $wd{end_date} le $date;
     return undef if $wd{create_date} gt $date;
 
-    my $ret = calc_total_by_date_range(
+    # Return full refund on removal if flag is set
+    if ( $service->settings->{allow_return_full_wd} ) {
+        $self->user->set_balance(
+            balance => $wd{total},
+            bonus   => $wd{bonus},
+        );
+        $self->user->bonus->add( bonus => $wd{bonus}, comment => { withdraw_id => $wd{id} } ) if $wd{bonus};
+        return ($wd{total}, $wd{bonus});
+    }
+
+    my $calc = calc_total_by_date_range(
         $self->billing,
+        %{ $service->get },
         %wd,
         end_date => $date,
     );
 
-    my $delta = $wd{total} - $ret->{total};
+    my ($delta_money, $delta_bonus) = (0, 0);
 
-    return undef if $delta < 0;
+    if ($calc->{total} > $wd{total}) {
+        my $paid_money = $wd{total};
+        my $paid_bonus = $wd{bonus};
+
+        $delta_money = $wd{total};
+        $wd{total} = 0;
+
+        if ( $paid_money <= 0 ) {
+            # If payment was only with bonuses, keep only the used part in bonus
+            # and return the rest to the user.
+            my $used_bonus = $calc->{total} > $paid_bonus ? $paid_bonus : $calc->{total};
+            $wd{bonus} = $used_bonus;
+            $delta_bonus = $paid_bonus - $used_bonus;
+        } else {
+            # Бонусы в приоритете: сохраняем столько бонусов, чтобы покрыть стоимость использованного периода, остаток — деньгами.
+            # delta_bonus = излишек бонусов сверх стоимости использованного периода.
+            my $bonus_to_keep = $paid_bonus < $calc->{total} ? $paid_bonus : $calc->{total};
+            my $cash_to_keep  = $calc->{total} - $bonus_to_keep;
+
+            $delta_money      = $paid_money - $cash_to_keep;
+            $delta_bonus      = $paid_bonus - $bonus_to_keep;
+
+            $wd{total} = $cash_to_keep;
+            $wd{bonus} = $bonus_to_keep;
+        }
+    } else {
+        $delta_money = $wd{total} - $calc->{total};
+        $wd{total} = $calc->{total};
+        $delta_bonus = $wd{bonus};
+        $wd{bonus} = 0;
+    }
+
+    $wd{months}   = $calc->{months};
+    $wd{end_date} = $date;
 
     $wd->set(
-        months => $ret->{months},
-        total => $ret->{total},
-        end_date => $date,
+        months   => $wd{months},
+        end_date => $wd{end_date},
+        total    => $wd{total},
+        bonus    => $wd{bonus},
     );
 
-    $self->user->set_balance( balance => $delta );
+    $self->user->set_balance(
+        balance => $delta_money,
+        bonus   => $delta_bonus,
+    );
 
-    return $delta;
+    $self->user->bonus->add( bonus => $delta_bonus, comment => { withdraw_id => $wd->id } ) if $delta_bonus;
+
+    return $delta_money, $delta_bonus;
 }
 
 sub calc_end_date_by_months {
-    my $billing = shift;
+    my $billing = shift || 'Simpler';
 
-    if ( $billing eq 'Honest' ) {
-        return Core::Billing::Honest::calc_end_date_by_months( @_ );
-    } else {
-        return Core::Billing::Simpler::calc_end_date_by_months( @_ );
-    }
+    no strict 'refs';
+    return &{"Core::Billing::${billing}::calc_end_date_by_months"}( @_ );
 }
 
 sub calc_total_by_date_range {
-    my $billing = shift;
+    my $billing = shift || 'Simpler';
 
-    if ( $billing eq 'Honest' ) {
-        return Core::Billing::Honest::calc_total_by_date_range( @_ );
-    } else {
-        return Core::Billing::Simpler::calc_total_by_date_range( @_ );
+    no strict 'refs';
+    return &{"Core::Billing::${billing}::calc_total_by_date_range"}( @_ );
+}
+
+sub calc_period_by_total {
+    my $billing = shift || 'Simpler';
+
+    no strict 'refs';
+    return &{"Core::Billing::${billing}::calc_period_by_total"}( @_ );
+}
+
+sub apply_partial_period {
+    my $us     = shift;
+    my $wd_ref = shift;
+    my $period = shift;
+
+    my $pay = calc_payment( $us, $wd_ref->{total} );
+    return if $pay;
+
+    my $user  = $us->user;
+    my $total = $user->get_balance;
+    my $bonus = calc_available_bonuses( $us->service, $user->get_bonus, $total );
+    my $months = calc_period_by_total(
+        $us->billing,
+        total  => $total + $bonus,
+        cost   => $wd_ref->{cost},
+        period => $period,
+    );
+
+    if ( $months ne '0.0000' ) {
+        $wd_ref->{total}  = $total + $bonus;
+        $wd_ref->{months} = $months;
     }
+}
+
+
+# Calculates the bonus amount available for payment, subject to limit_bonus_percent.
+#
+# | limit_bonus_percent | total  | Result                       |
+# |---------------------|--------|------------------------------|
+# | not set             | any    | $bonus (full bonuses)        |
+# | 100                 | any    | $bonus (full bonuses)        |
+# | < 100               | <= 0   | 0  (no base for percentage)  |
+# | < 100               | > 0    | $total * percent / 100       |
+sub calc_available_bonuses {
+    my $service = shift;
+    my $bonus = shift;
+    my $total = shift;
+
+    return 0 unless ref $service;
+    return 0 if $bonus <= 0;
+
+    my $limit_bonus_percent = $service->config->{limit_bonus_percent};
+
+    # Without a limit (or with a full 100% limit), bonuses are available regardless of total.
+    return $bonus unless length $limit_bonus_percent;
+    return $bonus if int($limit_bonus_percent) >= 100;
+
+    # With a partial limit, bonuses are capped as a percentage of total.
+    # A zero or negative total means nothing to cover, so no bonuses apply.
+    return 0 if $total <= 0;
+
+    my $max_bonus_amount = $total * int($limit_bonus_percent) / 100;
+    $bonus = $max_bonus_amount if $bonus > $max_bonus_amount;
+
+    return round( $bonus );
 }
 
 1;

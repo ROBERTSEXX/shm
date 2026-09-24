@@ -148,7 +148,7 @@ sub with {
         next unless ( $self->can( $method ) );
 
         if ( not exists $binds{ $method } or not exists $keys->{ $binds{ $method } } ) {
-            logger->warning("Key field not exist for `$method`. May be forgot load settings?");
+            logger->debug("Key field not exist for `$method`. May be forgot load settings?");
             next;
         }
 
@@ -352,6 +352,7 @@ sub activate_services {
                 STATUS_BLOCK,
                 STATUS_WAIT_FOR_PAY,
             ]},
+            auto_bill => 1,
         },
         order => [ user_service_id => 'ASC' ],
     );
@@ -360,17 +361,22 @@ sub activate_services {
 
     for ( @list ) {
         my $us = get_service('USObject', _id => $_->{user_service_id});
-        unless ( $us->lock( timeout => 5 ) ) {
+        unless ( $us->lock() ) {
             push @locked_services, $_->{user_service_id};
             next;
         }
         $us->touch;
     }
 
-    return @locked_services ? FAIL: SUCCESS, {
-        msg => sprintf("affected services: [%s]", (join ",", map $_->{user_service_id}, @list)),
-         @locked_services ? ( error =>  sprintf("locked services: [%s]", (join ",", @locked_services )) ) : (),
-    };
+    if ( scalar @locked_services ) {
+        return FAIL, {
+            error =>  sprintf("locked services: [%s]", (join ",", @locked_services )),
+        }
+    } else {
+        return SUCCESS, {
+            msg => sprintf("affected services: [%s]", (join ",", map $_->{user_service_id}, @list)),
+        }
+    }
 }
 
 sub list_expired_services {
@@ -416,20 +422,28 @@ sub list_for_api {
     my %args = (
         admin => 0,
         usi => undef,
-        parent => { '=', undef }, # parent IS NULL
         category => undef,
-        status => {'!=', STATUS_REMOVED},
         limit => 25,
         filter => {},
         get_smart_args( @_ ),
     );
 
     my $filter_by_settings = delete $args{filter}{settings};
+    my $filter_by_name = delete $args{filter}{name};
+    my $filter_by_next = delete $args{filter}{next};
 
     $args{where} = $self->query_for_filtering( %{$args{filter}} );
 
-    $args{where}{status} //= delete $args{status};
+    unless ( exists $args{where}{ sprintf("%s.%s", $self->table, $self->get_table_key ) } ||
+             exists $args{where}{ $self->get_table_key }
+    ) {
+        $args{where}{parent} //= { '=', undef };
+        $args{where}{status} //= {'!=', STATUS_REMOVED};
+    }
+
     $args{where}{settings} = { '-like' => $filter_by_settings } if $filter_by_settings;
+    $args{where}{'services.name'} = $filter_by_name if $filter_by_name;
+    $args{where}{'services.next'} = $filter_by_next if $filter_by_next;
 
     if ( $args{user_id} && $args{admin} ) {
         $args{where}{user_id} = delete $args{user_id};
@@ -441,14 +455,20 @@ sub list_for_api {
     # sorting the results according to the query
     my ( $field, $dir ) = @{ $self->query_for_order( %args ) };
     my @arr;
+    my %date_fields = map { $_ => 1 } qw(expire created);
+    my $is_date_field = $date_fields{ $field };
+
     if ( $dir eq 'desc' ) {
-        @arr = sort { $b->{ $field } <=> $a->{ $field } } @ret;
+        @arr = $is_date_field
+            ? sort { ($b->{ $field } // '') cmp ($a->{ $field } // '') } @ret
+            : sort { ($b->{ $field } // 0) <=> ($a->{ $field } // 0) } @ret;
     } else {
-        @arr = sort { $a->{ $field } <=> $b->{ $field } } @ret;
+        @arr = $is_date_field
+            ? sort { ($a->{ $field } // '') cmp ($b->{ $field } // '') } @ret
+            : sort { ($a->{ $field } // 0) <=> ($b->{ $field } // 0) } @ret;
     }
 
     return wantarray ? @arr : \@arr;
 }
 
 1;
-

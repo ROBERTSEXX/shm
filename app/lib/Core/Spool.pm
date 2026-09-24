@@ -7,6 +7,7 @@ use Core::Const;
 use Core::Utils qw( now );
 use Core::Task;
 use Core::Utils;
+use Time::HiRes qw(time);
 
 sub table { return 'spool' };
 
@@ -15,35 +16,69 @@ sub structure {
         id => {
             type => 'number',
             key => 1,
+            title => 'id задачи',
         },
         user_id => {
             type => 'number',
             auto_fill => 1,
+            title => 'id пользователя',
         },
         user_service_id => {
             type => 'number',
+            title => 'id услуги пользователя',
         },
-        event => { type => 'json', value => {} },
+        event => {
+            type => 'json',
+            value => {},
+            title => 'событие в формате JSON',
+        },
         prio => {           # приоритет команды
             type => 'number',
-            default => 0,
+            default => 100,
+            title => 'приоритет команды',
+            description => 'чем выше приоритет, тем раньше выполнится задача',
         },
         status => {         # status выполнения команды: 0-новая, 1-выполнена, 2-ошибка
             type => 'text',
             default => TASK_NEW,
+            enum => [TASK_NEW,TASK_SUCCESS,TASK_FAIL,TASK_DELAYED,TASK_STUCK,TASK_PAUSED],
+            title => 'статус задачи',
+            use_for_stats => 1,
+            stats_mode => 'inc',
+            stats_use_when_set => 1,
         },
-        response => { type => 'json', value => {} },
+        response => {
+            type => 'json',
+            value => {},
+            title => 'результат выполнения задачи',
+            readOnly => 1,
+        },
         created => {        # дата создания задачи
             type => 'now',
+            title => 'дата создания задачи',
+            readOnly => 1,
         },
         executed => {       # дата и время последнего выполнения
             type => 'date',
+            title => 'дата выполнения задачи',
+            readOnly => 1,
+            use_for_stats => 1,
+            stats_mode => 'inc',
+            stats_use_when_set => 1,
         },
         delayed => {        # задерка в секундах
             type => 'date',
             default => 0,
+            title => 'время задержки выполнения в секундах',
+            use_for_stats => 1,
+            stats_mode => 'inc',
+            stats_use_when_set => 1,
         },
         settings => { type => 'json', value => {} },
+        queue_id => {
+            type  => 'number',
+            title => 'id очереди (опционально)',
+        },
     }
 }
 
@@ -62,6 +97,46 @@ sub api_add {
     return $self->SUPER::api_add( %args );
 }
 
+sub add {
+    my $self = shift;
+    my %args = (
+        get_smart_args( @_ ),
+    );
+
+    if ( $args{status} eq TASK_NEW && $args{delayed} && $args{delayed} > 0  ) {
+        $args{status} = TASK_DELAYED;
+        $args{executed} = now; # delay вычисляется от текущего времени
+    } elsif ( $args{status} eq TASK_SUCCESS && $args{event} && $args{event}{period} && $args{event}{period} > 0 ) {
+        $args{status} = TASK_DELAYED;
+    }
+
+    if ( my $task_id = $self->{task_id} ) {
+        $args{event}{task_id} ||= $task_id;
+    }
+
+    my $res = $self->SUPER::add( %args );
+
+    if ( $self->table eq 'spool' ) { # do not run it for SpoolHistory
+        my $spool = $self;
+        $self->add_post_commit_callback( sub {
+            $spool->wake_workers();
+            get_service('SpoolQueue', _id => $args{queue_id} )->inc_added() if $args{queue_id};
+        });
+    }
+
+    return $res;
+}
+
+sub wake_workers {
+    my $self = shift;
+    my $list = $self->dbh->selectall_arrayref(
+        "SHOW FULL PROCESSLIST", { Slice => {} }
+    );
+    my ($proc) = sort { $b->{Time} <=> $a->{Time} }
+                 grep { ( $_->{State} // '' ) eq 'User sleep' } @$list;
+    $self->dbh->do("KILL QUERY $proc->{Id}") if $proc;
+}
+
 # формирует и выдает список задач для исполнения
 # список формируется именно в том порядке, в котором должен выполнятся
 sub list_for_all_users {
@@ -70,7 +145,6 @@ sub list_for_all_users {
         limit => 10,
         @_,
     );
-    my @vars;
 
     return $self->_list(
         where => {
@@ -78,6 +152,16 @@ sub list_for_all_users {
             executed => [
                 undef,
                 { '<', \[ '? - INTERVAL `delayed` SECOND', now ] },
+            ],
+            -or => [
+                queue_id => undef,
+                queue_id => { -in => \[
+                    "SELECT id FROM spool_queues"
+                    . " WHERE status = 'active'"
+                    . " AND (rate_limit IS NULL"
+                    . " OR last_executed_at IS NULL"
+                    . " OR TIMESTAMPADD(SECOND, 1.0/rate_limit, last_executed_at) <= NOW())"
+                ]},
             ],
         },
         order => [
@@ -89,14 +173,14 @@ sub list_for_all_users {
     );
 }
 
-sub process_all {
+sub process_all { # for unit tests
     my $self = shift;
 
     my @list = $self->list_for_all_users( limit => 10 );
     $self->process_one( $_ ) for @list;
 }
 
-sub process_one {
+sub process_one { # for spool.pl
     my $self = shift;
     my $task = shift;
 
@@ -105,31 +189,38 @@ sub process_one {
     }
     return undef unless $task;
 
-    my $user = get_service('user', _id => $task->{user_id} );
-    switch_user( $task->{user_id } );
-    if ( $user->id != 1 ) {
-        return undef unless $user->lock( timeout => 5 );
-    }
-
     my $spool = get_service('spool', _id => $task->{id} )->res( $task );
+    # Запись факта запуска задачи в историю ДО выполнения
+    $spool->write_history_start;
 
+    my $user = get_service('user', _id => $task->{user_id} );
     unless ( $user ) {
         $spool->finish_task(
             status => TASK_STUCK,
             response => { error => "User $task->{user_id} not exists" },
         );
-        return undef;
+        return $spool;
     }
+    switch_user( $task->{user_id } );
 
     if ( my $usi = $task->{settings}->{user_service_id} ) {
-        if ( my $service = get_service('us', _id => $usi ) ) {
-            return undef unless $service->lock;
-        } else {
+        my $us = get_service('us', _id => $usi );
+        unless ( $us ) {
             $spool->finish_task(
-                status => TASK_STUCK,
-                response => { error => "User service $usi not exists" },
+                status => TASK_SUCCESS,
+                response => { error => "User service is not exists" },
             );
-            return undef;
+            return $spool;
+        }
+
+        if ( $task->{event}->{name} ne EVENT_CHANGED ) {
+            unless ( $us->lock ) {
+                $spool->retry_task(
+                    status => TASK_DELAYED,
+                    response => { error => "User service is locked" },
+                );
+                return $spool;
+            }
         }
     }
 
@@ -141,7 +232,7 @@ sub process_one {
                 status => TASK_STUCK,
                 response => { error => "The server group does not exist" },
             );
-            return TASK_STUCK, $task, {};
+            return $spool, {};
         }
 
         my @servers = $server_group->get_servers;
@@ -151,7 +242,7 @@ sub process_one {
                 status => TASK_STUCK,
                 response => { error => "Can't found servers for group" },
             );
-            return TASK_STUCK, $task, {};
+            return $spool, {};
         }
 
         $task->{settings}->{server_id} = $servers[0]->{server_id};
@@ -168,37 +259,40 @@ sub process_one {
                 status => TASK_STUCK,
                 response => { error => sprintf( "Server not exists: %d", $server_id ) },
             );
-            return TASK_STUCK, $task, {};
+            return $spool, {};
         }
-        #return undef unless $server->lock;
     }
 
     my ( $status, $info ) = $spool->make_task();
 
-    logger->warning('Task fail: ' . Dumper $info ) if $status ne TASK_SUCCESS;
+    logger->warning('Task fail: ' . Dumper $info ) if $status ne TASK_SUCCESS && $status ne TASK_SKIPPED;
 
-    if ( $status eq TASK_SUCCESS ) {
+    if ( $status eq TASK_SUCCESS || $status eq TASK_SKIPPED || $status eq 'MOCK' ) {
         $spool->finish_task(
             status => $status,
             %{ $info },
         );
     }
-    elsif ( $status eq TASK_FAIL ) {
+    elsif ( $status eq TASK_FAIL || $status eq TASK_DELAYED ) {
         $spool->retry_task(
-            status => TASK_FAIL,
+            status => $status,
             %{ $info },
         )
     }
-    elsif ( $status eq TASK_STUCK ) {
+    else { # TASK_STUCK
         $spool->finish_task(
             status => TASK_STUCK,
             %{ $info },
         );
-    } else {
-        $spool->set( status => $status );
     }
 
-    return $status, $task, $info;
+    return $spool, $info;
+}
+
+sub queue {
+    my $self = shift;
+    my $queue_id = $self->res->{queue_id} or return undef;
+    return get_service('SpoolQueue', _id => $queue_id );
 }
 
 sub finish_task {
@@ -210,28 +304,35 @@ sub finish_task {
 
     $self->set(
         executed => now,
-        $self->event->{period} ? (delayed => $self->event->{period} ) : (),
         %args,
     );
 
-    if ( $args{status} ne TASK_SUCCESS ) {
-        if ( $self->event->{name} ne EVENT_CHANGED &&
-             $self->event->{name} ne EVENT_CHANGED_TARIFF &&
-             $self->settings->{user_service_id} ) {
-            if ( my $us = get_service('us', _id => $self->settings->{user_service_id} ) ) {
-                $us->set( status => STATUS_ERROR );
-            }
-        }
-    } else {
-        logger->dump("Task deleting:", $self );
-        if ( $self->event->{kind} eq 'Jobs' && $self->event->{period} ) {
-            $self->write_history if $args{status} ne TASK_SUCCESS;
-        }
-        else {
-            $self->write_history;
+    $self->write_history;
+
+    if ( my $queue = $self->queue ) {
+        my $is_terminal = (
+            ( $args{status} eq TASK_SUCCESS && !$self->is_periodic ) ||
+              $args{status} eq TASK_STUCK ||
+              $args{status} eq TASK_SKIPPED
+        ) ? 1 : 0;
+        $queue->on_task_finish( $args{status}, is_terminal => $is_terminal );
+    }
+
+    if ( $args{status} eq TASK_SUCCESS || $args{status} eq TASK_SKIPPED ) {
+        if ( $self->is_periodic ) {
+            $self->set(
+                delayed => $self->event->{period},
+                status => TASK_DELAYED,
+            )
+        } else {
             $self->delete;
         }
     }
+}
+
+sub is_periodic {
+    my $self = shift;
+    return $self->event && $self->event->{period} && $self->event->{period} > 0;
 }
 
 # TODO: check max retries
@@ -243,10 +344,14 @@ sub retry_task {
     );
 
     my $delayed = $self->res->{delayed}||=1;
+    $delayed ||= 1;  # ensure numeric value
     # не меняем делей, если задан вручную (больше 15 мин)
     if ( $delayed < 900 ) {
-        $delayed *= 5;  # 5s, 25s, 125(~2m), 625(~10m),... 900(15m)
+        $delayed *= 3;  # 3s, 9s, 27s, 81s,...
         $delayed = 900 if $delayed > 900; # max 15 min
+    } else {
+        # set minimal delay for retry tasks with custom delay
+        $delayed = 3;
     }
 
     $self->set(
@@ -257,6 +362,11 @@ sub retry_task {
     );
 
     $self->write_history;
+
+    if ( my $queue = $self->queue ) {
+        $queue->on_task_finish( TASK_FAIL ) if $args{status} eq TASK_FAIL;
+        $queue->on_task_finish( TASK_DELAYED ) if $delayed;
+    }
 }
 
 sub api_manual_action {
@@ -320,12 +430,57 @@ sub api_retry {
 
 sub history {
     my $self = shift;
-    return $self->srv('SpoolHistory');
+    state $history ||= $self->srv('SpoolHistory');
+    return $history;
+}
+
+sub write_history_start {
+    my $self = shift;
+    my %task_data = $self->get;
+
+    $self->{spool} = {
+        pid => $$,
+        started => time(),
+    };
+    $task_data{response}{spool} = $self->{spool};
+
+    my $history_id = $self->history->add(
+        %task_data,
+        created => now,
+    );
+
+    $self->{history_id} = $history_id;
 }
 
 sub write_history {
     my $self = shift;
-    $self->history->add( $self->get );
+    my %task_data = $self->get;
+
+    if ( $self->{spool}{started} ) {
+        my $time = time();
+        $self->{spool}{finished} = $time;
+        $self->{spool}{duration} = sprintf( "%.5f", $time - $self->{spool}{started} ) + 0;
+        $task_data{response}{spool} = $self->{spool};
+    }
+
+    if ( my $history = $self->history->id( $self->{history_id} ) ) {
+        # Обновляем существующую запись
+        $history->set( %task_data );
+    } else {
+        # Старое поведение — если по каким-то причинам history_id нет
+        $self->history->add( %task_data );
+    }
+}
+
+sub statuses {
+    my $self = shift;
+    my $list = $self->dbh->selectall_arrayref('SELECT status, COUNT(status) as cnt FROM '. $self->table . ' GROUP by status', { Slice => {} });
+
+    if ( wantarray ) {
+        return @$list;
+    } else {
+        return $list;
+    }
 }
 
 1;

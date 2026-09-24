@@ -1,8 +1,5 @@
 package Core::System::Service;
 use strict;
-
-use base qw( Core::System::Object );
-
 use Core::System::ServiceManager qw($SERVICE_MANAGER);
 
 sub new {
@@ -24,6 +21,10 @@ sub register {
 
 sub unregister {
     return $SERVICE_MANAGER->unregister_service(shift);
+}
+
+sub unregister_child {
+    return $SERVICE_MANAGER->unregister_child(shift);
 }
 
 1;

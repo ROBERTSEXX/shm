@@ -6,9 +6,27 @@ use base qw( Core::System::Service );
 
 use Data::Dumper;
 use Core::System::ServiceManager qw(get_service $data);
-use Core::Utils qw( encode_json  );
+use Core::Utils qw(
+    encode_json
+    blessed
+);
 
-$SIG{__DIE__} = sub { get_service('logger')->warning( @_ ) };
+$SIG{__DIE__} = sub {
+    my $error = shift;
+
+    # Don't log errors that are caught inside eval blocks
+    return if $^S;
+
+    # 1. Проверяем, является ли ошибка объектом Template::Exception
+    if (blessed($error) && $error->isa('Template::Exception')) {
+        my $type = $error->type;
+        # 2. Если это STOP или RETURN, просто выходим из обработчика
+        return if $type eq 'stop' || $type eq 'return';
+    }
+
+    # Во всех остальных случаях — логируем
+    get_service('logger')->error($error);
+};
 
 my $LEVEL_TRACE     = 0;
 my $LEVEL_DEBUG     = 1;
@@ -87,6 +105,8 @@ sub make_message {
     for ( @msg ) {
         if ( ref $_ eq 'HASH' || ref $_ eq 'ARRAY' ) {
             $_ = encode_json( $_ );
+        } elsif ( blessed $_ ) {
+            $_ = Data::Dumper->new( [ $_ ] )->Indent(0)->Quotekeys(0)->Sortkeys(1)->Terse(1)->Dump();
         }
     }
     my $msg = join(' ', @msg );
@@ -151,7 +171,7 @@ sub write_log_file {
 }
 
 sub trace   { shift->_log( 'TRACE', @_ ) }
-sub dump    { shift->_log( 'DUMP', Data::Dumper->new( [@_] )->Indent(1)->Quotekeys(0)->Sortkeys(1)->Dump() ) }
+sub dump    { shift->_log( 'DUMP', Data::Dumper->new( [@_] )->Indent(1)->Quotekeys(0)->Sortkeys(1)->Terse(1)->Dump() ) }
 sub debug   { shift->_log( 'DEBUG', @_ ) }
 sub info    { shift->_log( 'INFO', @_ ) }
 sub warning { shift->_log( 'WARNING', @_ ) }

@@ -3,25 +3,34 @@ package Core::ServerGroups;
 use v5.14;
 use parent 'Core::Base';
 use Core::Base;
+use Core::Const;
+use Core::Utils qw( any );
 
 sub table { return 'servers_groups' };
+sub dbh { shift->dbh_auto_commit };
 
 sub structure {
     return {
         group_id => {
             type => 'number',
             key => 1,
+            title => 'id группы'
         },
         name => {
             type => 'text',
+            title => 'произвольное название группы',
         },
-        type => {          # способ выборки серверов из группы
+        type => {
             type => 'text',
             default => 'random',
+            enum => ['random','by-one','evenly'],
+            title => 'способ выборки сервера',
         },
         transport => {
             type => 'text',
             default => 'ssh',
+            enum => ['ssh','http','telegram','mail','local'],
+            title => 'транспорт',
         },
         settings => {
             type => 'text',
@@ -72,6 +81,20 @@ sub get_servers {
     }
 
     return undef;
+}
+
+sub delete {
+    my $self = shift;
+    my %args = (
+        group_id => undef,
+        @_,
+    );
+
+    if ( any { $args{group_id} == $_ } (GROUP_ID_MAIL, GROUP_ID_LOCAL) ) {
+        return undef;
+    }
+
+    return $self->SUPER::delete( @_ );
 }
 
 1;

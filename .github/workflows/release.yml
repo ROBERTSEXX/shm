@@ -1,0 +1,214 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    tags:
+      - '*'
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: danuk/shm
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format
+        run: |
+          # Get the tag name
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          echo "Tag: $TAG_NAME"
+
+          # Tag must start with a digit
+          if [[ ! "$TAG_NAME" =~ ^[0-9] ]]; then
+            echo "❌ ERROR: Tag '$TAG_NAME' does not start with a digit"
+            echo "Tags must start with a digit (e.g., 1.0.0, 2.10.1), not with 'v' or other prefix"
+
+            # Delete invalid tag from remote
+            echo "🗑️ Deleting invalid tag from origin..."
+            git push origin --delete "refs/tags/$TAG_NAME" || true
+
+            exit 1
+          fi
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for git describe
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Extract version info
+      id: version
+      run: |
+        # Get the tag name
+        TAG=${GITHUB_REF#refs/tags/}
+        echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+        # Extract tag suffix (e.g., 'beta' from '2.10.1-beta')
+        TAG_SUFFIX=""
+        if [[ "$TAG" =~ -([a-zA-Z]+)$ ]]; then
+          TAG_SUFFIX="${BASH_REMATCH[1]}"
+        fi
+        echo "tag_suffix=${TAG_SUFFIX}" >> $GITHUB_OUTPUT
+        TAG_SUFFIX_LOWER=$(echo "$TAG_SUFFIX" | tr '[:upper:]' '[:lower:]')
+
+        # A '-latest' suffix (e.g. 1.2.3-latest, case-insensitive) is stripped
+        # from the Docker tag / version string, so it behaves like a plain
+        # release tag (1.2.3). A standalone 'latest' Docker tag is still
+        # pushed further down via the tag_suffix output.
+        if [ "$TAG_SUFFIX_LOWER" = "latest" ]; then
+          DOCKER_TAG="${TAG%-$TAG_SUFFIX}"
+        else
+          DOCKER_TAG="$TAG"
+        fi
+        echo "docker_tag=${DOCKER_TAG}" >> $GITHUB_OUTPUT
+
+        # Get minor version (1.2 from 1.2.3)
+        VERSION_MINOR=$(echo $DOCKER_TAG | cut -d '.' -f 1,2)
+        echo "minor=${VERSION_MINOR}" >> $GITHUB_OUTPUT
+
+        # Get git revision
+        REV=$(git rev-parse --short HEAD)
+        echo "rev=${REV}" >> $GITHUB_OUTPUT
+
+        # Create version string for app/version
+        VERSION_STRING="${DOCKER_TAG}-${REV}"
+        echo "version_string=${VERSION_STRING}" >> $GITHUB_OUTPUT
+
+        # Create minor-with-suffix tag (e.g., '3.0-rc' from '3.0.1-rc').
+        # Not created for the 'latest' suffix - it's stripped instead.
+        if [ -n "$TAG_SUFFIX" ] && [ "$TAG_SUFFIX_LOWER" != "latest" ]; then
+          MINOR_WITH_SUFFIX="${VERSION_MINOR}-${TAG_SUFFIX}"
+        else
+          MINOR_WITH_SUFFIX=""
+        fi
+        echo "minor_with_suffix=${MINOR_WITH_SUFFIX}" >> $GITHUB_OUTPUT
+
+        # A tag without a suffix (e.g. 1.2.3) is a release and also gets a minor
+        # version tag (e.g. 1.2). A '-latest' suffix (e.g. 1.2.3-latest) is
+        # treated as a release too. Any other suffix (e.g. 1.2.3-beta) is a
+        # pre-release and does not get the minor version tag.
+        if [ -z "$TAG_SUFFIX" ] || [ "$TAG_SUFFIX_LOWER" = "latest" ]; then
+          IS_RELEASE="true"
+          echo "Tag has no suffix (or 'latest' suffix) - treated as a release, will also push minor version tag"
+        else
+          IS_RELEASE="false"
+          echo "Tag has suffix - will also push suffix tags instead"
+        fi
+
+        echo "is_release=${IS_RELEASE}" >> $GITHUB_OUTPUT
+        echo "Building version: ${VERSION_STRING}"
+
+    - name: Create version.json
+      run: |
+        cat > app/version.json << EOF
+        {
+            "version": "${{ steps.version.outputs.version_string }}",
+            "commitSha": "${{ github.sha }}",
+            "releaseUrl": "https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.tag }}"
+        }
+        EOF
+        cat app/version.json
+
+    - name: Build Core for tests
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        load: true
+        target: core
+        platforms: linux/amd64
+        tags: shm-core:test
+        cache-from: type=gha,scope=core
+        cache-to: type=gha,mode=max,scope=core
+
+    - name: Run unit tests
+      run: |
+        docker run --rm \
+          -v ${{ github.workspace }}/app:/app \
+          shm-core:test \
+          prove -r -j4 /app/t/unit/
+
+    - name: Build and push API image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        target: api
+        tags: |
+          ${{ format('{0}-api:{1}', env.IMAGE_NAME, steps.version.outputs.docker_tag) }}
+          ${{ steps.version.outputs.is_release == 'true' && format('{0}-api:{1}', env.IMAGE_NAME, steps.version.outputs.minor) || '' }}
+          ${{ steps.version.outputs.minor_with_suffix != '' && format('{0}-api:{1}', env.IMAGE_NAME, steps.version.outputs.minor_with_suffix) || '' }}
+          ${{ steps.version.outputs.tag_suffix != '' && format('{0}-api:{1}', env.IMAGE_NAME, steps.version.outputs.tag_suffix) || '' }}
+        cache-from: type=gha,scope=api
+        cache-to: type=gha,mode=max,scope=api
+
+    - name: Build and push Core image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        target: core
+        tags: |
+          ${{ format('{0}-core:{1}', env.IMAGE_NAME, steps.version.outputs.docker_tag) }}
+          ${{ steps.version.outputs.is_release == 'true' && format('{0}-core:{1}', env.IMAGE_NAME, steps.version.outputs.minor) || '' }}
+          ${{ steps.version.outputs.minor_with_suffix != '' && format('{0}-core:{1}', env.IMAGE_NAME, steps.version.outputs.minor_with_suffix) || '' }}
+          ${{ steps.version.outputs.tag_suffix != '' && format('{0}-core:{1}', env.IMAGE_NAME, steps.version.outputs.tag_suffix) || '' }}
+        cache-from: type=gha,scope=core
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.version.outputs.tag }}
+        name: Release ${{ steps.version.outputs.docker_tag }}
+        generate_release_notes: true
+        body: |
+          ## Docker Images Built
+
+          ### API Image
+          - `${{ format('{0}-api:{1}', env.IMAGE_NAME, steps.version.outputs.docker_tag) }}`
+          ${{ steps.version.outputs.is_release == 'true' && format('- `{0}-api:{1}`', env.IMAGE_NAME, steps.version.outputs.minor) || '' }}
+          ${{ steps.version.outputs.minor_with_suffix != '' && format('- `{0}-api:{1}`', env.IMAGE_NAME, steps.version.outputs.minor_with_suffix) || '' }}
+          ${{ steps.version.outputs.tag_suffix != '' && format('- `{0}-api:{1}`', env.IMAGE_NAME, steps.version.outputs.tag_suffix) || '' }}
+
+          ### Core Image
+          - `${{ format('{0}-core:{1}', env.IMAGE_NAME, steps.version.outputs.docker_tag) }}`
+          ${{ steps.version.outputs.is_release == 'true' && format('- `{0}-core:{1}`', env.IMAGE_NAME, steps.version.outputs.minor) || '' }}
+          ${{ steps.version.outputs.minor_with_suffix != '' && format('- `{0}-core:{1}`', env.IMAGE_NAME, steps.version.outputs.minor_with_suffix) || '' }}
+          ${{ steps.version.outputs.tag_suffix != '' && format('- `{0}-core:{1}`', env.IMAGE_NAME, steps.version.outputs.tag_suffix) || '' }}
+
+          **Version:** `${{ steps.version.outputs.version_string }}`
+          **Git Revision:** `${{ steps.version.outputs.rev }}`
+          ${{ steps.version.outputs.is_release != 'true' && format('**Note:** This is a `{0}` pre-release tag. Only {0} tags are created.', steps.version.outputs.tag_suffix) || '' }}
+
+          ## What's Changed
+
+          *Changelog will be generated automatically below based on commits and pull requests.*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

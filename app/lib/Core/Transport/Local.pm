@@ -14,6 +14,12 @@ sub send {
     my $template_id =   $task->event_settings->{template_id} ||
                         $task->settings->{template_id};
 
+    unless ( $template_id ) {
+        if ( my $server = $task->server ) {
+            $template_id = $server->get_settings->{template_id};
+        }
+    }
+
     my $template = get_service('template', _id => $template_id );
     unless ( $template ) {
         return undef, {
@@ -32,11 +38,16 @@ sub send {
         vars => {
             SUCCESS => SUCCESS,
             FAIL => FAIL,
+            SKIP => SKIP,
+            STUCK => '',
         },
     );
 
+    my $status = SUCCESS;
     my %answer = $task->answer;
-    my $status = exists $answer{status} ? $answer{status} : SUCCESS;
+    if ( exists $answer{status} ) {
+        $status = length $answer{status} ? $answer{status} : undef;
+    }
 
     return $status, {
         result => $content,

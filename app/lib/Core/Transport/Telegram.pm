@@ -6,17 +6,50 @@ use v5.14;
 use utf8;
 use Core::Base;
 use Core::Const;
+use SHM qw( validate_session );
 use Core::System::ServiceManager qw( get_service logger );
-use LWP::UserAgent ();
 use Core::Utils qw(
     switch_user
     encode_utf8
     encode_json
+    encode_base64
+    encode_base64url
     decode_json
+    decode_base64url
+    random_base64url
+    jwt_decode
     passgen
     blessed
     now
+    parse_headers
+    print_header
+    print_json
+    to_query_string
+    qrencode
+    sha256
+    session_id_cookie
 );
+
+# https://core.telegram.org/resources/cidr.txt
+sub telegram_ips {
+    my @ips = qw(
+        91.108.56.0/22
+        91.108.4.0/22
+        91.108.8.0/22
+        91.108.16.0/22
+        91.108.12.0/22
+        149.154.160.0/20
+        91.105.192.0/23
+        91.108.20.0/22
+        185.76.151.0/24
+        2001:b28:f23d::/48
+        2001:b28:f23f::/48
+        2001:67c:4e8::/48
+        2001:b28:f23c::/48
+        2a0a:f280::/32
+    );
+    return \@ips;
+}
 
 sub init {
     my $self = shift;
@@ -24,16 +57,27 @@ sub init {
         @_,
     );
 
-    $self->{server} = 'https://api.telegram.org';
-    $self->{lwp} = LWP::UserAgent->new(timeout => 10);
     $self->{webhook} = 0;
     $self->{deny_answer_direct} = 1;
 
     return $self;
 }
 
+sub telegram_server { shift->config->{server} || 'https://api.telegram.org' };
+sub telegram_oauth_server { shift->config->{oauth_server} || 'https://oauth.telegram.org' };
+
+sub http_transport {
+    my $self = shift;
+    return $self->{http_transport} ||= get_service('Transport::Http');
+}
+
 sub config {
-    return get_service('config')->data_by_name('telegram') || {};
+    return cfg('telegram') || {};
+}
+
+sub tg_settings {
+    my $self = shift;
+    return $self->config->{ $self->profile_name } || {};
 }
 
 sub user_tg_settings {
@@ -42,17 +86,74 @@ sub user_tg_settings {
     return $self->{user_tg_settings} if $self->{user_tg_settings};
 
     my $data = $self->user->settings->{telegram} || {};
-    my $profile = $data->{ $self->{profile} } || {};
+    my $profile = $data->{ $self->profile_name } || {};
 
     $data = { %{$data}, %{$profile} };
 
     return $self->{user_tg_settings} = $data || {};
 }
 
+sub api_set_user_tg_settings {
+    my $self = shift;
+    my %args = @_;
+
+    my $data = delete $args{ PUTDATA } || delete $args{ POSTDATA };
+    my $json = decode_json( $data );
+    unless ( $json ) {
+        report->add_error("Incorrect JSON data: $data");
+        return undef;
+    }
+
+    $self->user->set_settings({
+        telegram => $json,
+    });
+    return $self->user->settings->{telegram} || {};
+}
+
+sub api_delete_user_tg_settings {
+    my $self = shift;
+
+    my $tg_user_id = $self->user_tg_settings->{user_id};
+    if ( defined $tg_user_id && $tg_user_id ne '' ) {
+        $self->user->logins->delete( where => { login => $tg_user_id, type => 'telegram' } );
+    }
+
+    $self->user->set_settings({
+        telegram => {},
+    });
+    return { msg => 'Telegram settings deleted successfully' };
+}
+
 # methods for Templates
 sub settings { shift->user_tg_settings };
 sub login { shift->user_tg_settings->{username} };
+sub shm_login { shift->{shm_login} };
 sub username { shift->user_tg_settings->{username} };
+sub response {
+    my $self = shift;
+    my $data = shift;
+    my $expire = 86400 * 2; # 48h
+
+    if ( $data ) {
+        $self->{response} = $data;
+        cache->set_json( sprintf('tg_response_%s_%s', $self->profile, $self->user_id), $data, $expire );
+    }
+
+    return $self->{response};
+};
+
+sub response_from_cache {
+    my $self = shift;
+    my %args = (
+        cleanup => 0,
+        get_smart_args( @_ ),
+    );
+
+    my $key = sprintf('tg_response_%s_%s', $self->profile, $self->user_id);
+    my $json = cache->get_json( $key );
+    cache->delete( $key ) if $json && $args{cleanup};
+    return $json;
+}
 
 # устанавливает указанный профиль: token & chat_id
 # Не устанавливаем chat_id, если он был установлен ранее,
@@ -61,15 +162,22 @@ sub profile {
     my $self = shift;
     my $name = shift;
 
-    return $self->{profile} unless $name;
+    return $self->profile_name unless $name;
+    if ( my $profile_name = $self->profile_name ) {
+        return $self if
+            $profile_name eq $name &&
+            $self->{profile} eq $name &&
+            $self->{token};
+    }
 
     my $config = $self->config;
 
     $self->{profile} = $name;
+    delete $self->{user_tg_settings};  # invalidate cache: settings depend on profile_name
 
     if ( my $profile = $config->{ $name } ) {
         $self->{token} = $profile->{token};
-        $self->{chat_id} ||= $profile->{chat_id} if $profile->{chat_id};
+        $self->{chat_id} = $profile->{chat_id} if $profile->{chat_id};
     } else {
         $self->{token} = $config->{token}; # for backward compatible
     }
@@ -80,13 +188,21 @@ sub profile {
     return $self;
 }
 
+sub profile_name { shift->{profile} };
+
+# for templates (always return array ref)
+sub profiles {
+    my $self = shift;
+    return [ $self->user_profiles() ];
+}
+
 sub user_profiles {
     my $self = shift;
 
     my @profiles;
     my $user_profiles = $self->user->settings->{telegram} || {};
 
-    if ( my $profile = $self->{profile} ) {
+    if ( my $profile = $self->profile_name ) {
         push @profiles, $profile;
     } else {
         for ( keys %$user_profiles ) {
@@ -144,8 +260,9 @@ sub task_send {
         task => $task,
         vars => {
             tg => sub { $self },
+            telegram => sub { $self },
             tg_api => sub{ $self->tg_api( @_ ) },
-            response => sub { $self->{response} },
+            response => sub { $self->response },
         },
     );
     return SUCCESS, { msg => "Шаблон не содержит данных" } unless $message;
@@ -162,22 +279,22 @@ sub task_send {
         }
     }
 
-    my @ret = $self->send( $message );
+    my ( $ret ) = $self->send( $message );
+    my $tg_answer_error = $ret->{error};
 
-    if ( my $error = $ret[0]->{error} ) {
-        if ( ref $error eq 'HASH' ) {
-            # http was executed
-            return SUCCESS, $ret[0] if $error->{error_code} == 403; # skip
-            return undef, $ret[0] if $error->{error_code} == 400; # bad request
-            return undef, $ret[0] if $error->{error_code} == 404; # method not found
-            return FAIL, $ret[0]; # retry
-        } else {
-            # chat_id or token not found, etc...
-            return SUCCESS, $ret[0]; # skip
-        }
-    } else {
-        return SUCCESS, $ret[0];
+    if ( ref $tg_answer_error eq 'HASH' ) {
+            # Check `error` field from Telegram answer
+            return SUCCESS, $ret if $tg_answer_error->{error_code} == 403; # skip
+            return undef, $ret if $tg_answer_error->{error_code} == 400; # bad request
+            return undef, $ret if $tg_answer_error->{error_code} == 404; # method not found
+            return FAIL, $ret; # retry
     }
+
+    if ( $ret->{error_info} ) {
+        return FAIL, $ret;
+    }
+
+    return SUCCESS, $ret;
 }
 
 sub send {
@@ -189,7 +306,9 @@ sub send {
     );
 
     my @ret;
-    my @profiles = $self->user_profiles();
+    my @profiles = $self->profile_name
+        ? ( $self->profile_name )
+        : $self->user_profiles();
     for my $profile ( @profiles ) {
         $self->profile( $profile );
 
@@ -245,14 +364,24 @@ sub send {
         my $message = decode_json( $response->decoded_content );
         if ( $response->is_success ) {
             logger->info( $message );
-            push @ret, { message => 'successful', profile => $profile, response => $message };
-            $self->{response} = $message;
+            push @ret, {
+                message => 'successful',
+                profile => $profile,
+                response => $message,
+            };
+            $self->response( $message );
         } else {
             logger->error( $message );
             push @ret, {
-                error => $message,
+                message => 'error',
                 profile => $profile,
+                response => $message,
                 request => decode_json( $response->request->content ),
+                error => $message,
+                error_info => {
+                    code => $response->code,
+                    line => $response->status_line,
+                },
             };
         }
     }
@@ -271,10 +400,10 @@ sub bot {
         return undef;
     }
 
-    $self->profile( $template_id ) unless $self->{profile};
+    $self->profile( $template_id ) unless $self->profile_name;
 
     unless ( $self->chat_id ) {
-        logger->debug('chat_id не найден' );
+        logger->error('chat_id не найден');
         return undef;
     }
 
@@ -291,7 +420,7 @@ sub template {
     $self->{template_id} = $template_id if $template_id;
     return undef unless $self->{template_id};
 
-    my $template = get_service('template', _id => $self->{template_id});
+    my $template = $self->srv('template', _id => $self->{template_id});
     return $template;
 }
 
@@ -409,6 +538,8 @@ sub http {
             next if $k eq 'document' || $k eq 'photo';
             if ( ref $data{$k} ) {
                 $data{$k} = encode_json( $data{$k} );
+            } elsif ( defined $data{$k} ) {
+                $data{$k} = encode_utf8( $data{$k} );
             }
         }
 
@@ -434,22 +565,24 @@ sub http {
         }
     }
 
-    my $response = $self->{lwp}->$method(
-        sprintf('%s/bot%s/%s', $self->{server}, $self->token, $url ),
-        Content_Type => $args{content_type},
-        Content => encode_utf8( $content ),
+    my $response = $self->http_transport->http(
+        method => $method,
+        url => sprintf('%s/bot%s/%s', $self->telegram_server, $self->token, $url ),
+        content_type => $args{content_type},
+        content => $content,
     );
 
-    logger->dump( $response->request );
+    logger->dump('Send to TG API', $response->request );
+    logger->dump('Answer from TG API', $response->decoded_content );
 
     unless ( $response->is_success ) {
         my $message = $response->decoded_content;
         logger->error( $message );
 
-        if ( $response->code == 403 ) {
+        if ( $response->code == 403 && $message =~ /(?:bot was blocked|user is deactivated)/i ) {
             $self->user->set_settings({
                 telegram => {
-                    $self->{profile} => {
+                    $self->profile_name() => {
                         status => 'kicked',
                     },
                 }
@@ -463,6 +596,7 @@ sub sendMessage {
     my $self = shift;
     my %args = (
         text => undef,
+        try_to_edit => 0,
         parse_mode => 'HTML',
         disable_web_page_preview => 'True',
         @_,
@@ -472,6 +606,18 @@ sub sendMessage {
 
     if ( length( $args{text} ) > 4096 ) {
         $args{text} = substr( $args{text}, 0, 4093 ) . '...';
+    }
+
+    if ( my $try_to_edit = delete $args{try_to_edit} ) {
+        if ( my $message_id = $self->smart_message_id ) {
+            my $res = $self->http( 'editMessageText',
+                data => {
+                    %args,
+                    message_id => $message_id,
+                }
+            );
+            return $res if $res->is_success;
+        }
     }
 
     return $self->http( 'sendMessage',
@@ -493,8 +639,17 @@ sub deleteMessage {
     );
 }
 
+sub find_user_by_tg {
+    my $self = shift;
+    my $tg_user = shift;
+
+    return $self->user->logins->id( $tg_user->{id}, ['telegram'] );
+}
+
 sub get_shm_login {
-    return sprintf( "@%s", shift );
+    my $self = shift;
+    my $tg_user_id = shift;
+    return $tg_user_id;
 }
 
 sub auth {
@@ -507,54 +662,46 @@ sub auth {
     my $username = $tg_user->{username};
     my $full_name = sprintf("%s %s", $tg_user->{first_name}, $tg_user->{last_name} );
 
-    my ( $user ) = $self->user->_list(
-        where => {
-            -OR => [
-                sprintf('%s->>"$.%s"', 'settings', 'telegram.user_id') => $telegram_user_id,
-                login => get_shm_login( $telegram_user_id ),
-                $username ? ( sprintf('lower(%s->>"$.%s")', 'settings', 'telegram.username') => lc( $username ) ) : (),
-                sprintf('%s->>"$.%s"', 'settings', 'telegram.chat_id') => $self->chat_id, # for backward compatible
-            ],
-        },
-        limit => 1,
-    );
-    return undef unless $user;
+    my $login = $self->find_user_by_tg( $tg_user );
+    return undef unless $login;
+    return undef unless $self->chat_id;
 
-    switch_user( $user->{user_id} );
+    switch_user( $login->user_id );
 
-    return $self->user unless $self->chat_id;
+    # Only persist chat_id from private chats.
+    # Group/supergroup/channel chat_id must NOT overwrite the user's personal chat_id.
+    my $is_private = ( $self->message->{chat}->{type} // '' ) eq 'private';
 
-    $self->user->set( last_login => now );
-    $self->user->set_json(
-        'settings', {
-            telegram => {
-                login => $tg_user->{username}, # for backward compatible
-                username => $tg_user->{username},
-                first_name => $tg_user->{first_name},
-                last_name => $tg_user->{last_name},
-                language_code => $tg_user->{language_code},
-                is_premium => $tg_user->{is_premium},
-                chat_id => $self->chat_id, # for backward compatible
-                $self->{profile} => {
-                    chat_id => $self->chat_id,
-                },
+    my %telegram_settings = (
+        telegram => {
+            user_id => $telegram_user_id,  # field for auth
+            login => $tg_user->{username}, # for backward compatible
+            username => $tg_user->{username},
+            exists $tg_user->{first_name} ? ( first_name => $tg_user->{first_name} ) : (),
+            exists $tg_user->{last_name} ? ( last_name => $tg_user->{last_name} ) : (),
+            exists $tg_user->{language_code} ? ( language_code => $tg_user->{language_code} ) : (),
+            exists $tg_user->{is_premium} ? ( is_premium => $tg_user->{is_premium} ) : (),
+            $is_private ? ( chat_id => $self->chat_id ) : (),  # for backward compatible
+            $self->profile_name() => {
+                $is_private ? ( chat_id => $self->chat_id ) : (),
+                status => 'member',
             },
         },
-    ) if $self->message->{chat}->{type} eq 'private';
-
-    return $self->user;
-}
-
-sub deleteMessage {
-    my $self = shift;
-    my %args = (
-        message_id => undef,
-        @_,
     );
 
-    return $self->http( 'deleteMessage',
-        data => \%args,
-    );
+    $login->user->set( last_login => now );
+    $login->user->set_settings( \%telegram_settings ); # for backward compatible
+
+    $login->set_settings({
+        auth => {
+            date => now(),
+        },
+        %telegram_settings,
+    }) if $is_private;
+
+    $self->{shm_login} = $login->get_login;
+
+    return $login->user;
 }
 
 sub tg_user {
@@ -578,6 +725,410 @@ sub tg_user {
     return $user;
 }
 
+sub verify_telegram_secret {
+    my $self = shift;
+
+    my $expected_token = $self->config->{ $self->profile }->{secret};
+    unless ( $expected_token ) {
+        logger->error(sprintf(
+            "Telegram webhook secret is not configured for profile '%s' — request rejected (fail-closed)",
+            $self->profile_name // '',
+        ));
+        return 0;
+    }
+
+    my $secret_token = parse_headers->{'x_telegram_bot_api_secret_token'};
+    return $secret_token eq $expected_token;
+}
+
+# Validates that a return_url is safe to redirect to.
+# Allows only relative URLs or absolute URLs on the same host as the server.
+sub is_safe_return_url {
+    my $self = shift;
+    my $url  = shift;
+
+    return 0 unless defined $url && $url ne '';
+
+    # Reject dangerous schemes regardless of host
+    return 0 if $url =~ m{^(javascript|data|vbscript):}i;
+
+    # Relative URLs are always safe
+    return 1 if $url =~ m{^/[^/]};
+
+    # Only allow http/https absolute URLs
+    return 0 unless $url =~ m{^https?://}i;
+
+    my $host = $ENV{HTTP_X_FORWARDED_HOST} || $ENV{HTTP_HOST};
+
+    # If no server host is known (e.g. CLI/test), accept any http/https URL
+    return 1 unless $host;
+
+    # Enforce same-host in production
+    if ( $url =~ m{^https?://([^/?#]+)}i ) {
+        my $url_host = $1;
+        $url_host =~ s/:\d+$//;  # strip port
+        $host     =~ s/:\d+$//;
+        return lc($url_host) eq lc($host);
+    }
+
+    return 0;
+}
+
+sub telegram_web_callback_url {
+    my $self = shift;
+
+    my $scheme = $ENV{HTTP_X_FORWARDED_PROTO}
+        || $ENV{REQUEST_SCHEME}
+        || ( ($ENV{HTTPS} || '') =~ /^(1|on)$/i ? 'https' : 'http' );
+
+    my $host = $ENV{HTTP_X_FORWARDED_HOST}
+        || $ENV{HTTP_HOST}
+        || 'localhost';
+
+    return sprintf('%s://%s/shm/v1/telegram/web/callback', $scheme, $host);
+}
+
+sub telegram_oidc_state_cache_key {
+    my $self = shift;
+    my $state = shift;
+    return sprintf('tg_oidc_state_%s', $state || '');
+}
+
+sub telegram_oidc_init {
+    my $self = shift;
+    my %args = (
+        profile => 'telegram_bot',
+        redirect_uri => undef,
+        return_url => undef,
+        scope => 'openid profile',
+        register_if_not_exists => 0,
+        bind_to_profile => 0,
+        bind_only_if_new => 0,
+        session_id => undef,
+        ttl => 600,
+        @_,
+    );
+
+    my $redirect_uri = $args{redirect_uri} || $self->telegram_web_callback_url;
+    my $client_id = $self->telegram_oidc_client_id( profile => $args{profile} );
+
+    unless ( $client_id ) {
+        report->error('Telegram OIDC client_id is not configured');
+        return undef;
+    }
+
+    my $state = random_base64url(32);
+    my $nonce = random_base64url(32);
+    my $code_verifier = random_base64url(32);
+    my $code_challenge = encode_base64url( sha256($code_verifier) );
+
+    my $ctx = {
+        state => $state,
+        nonce => $nonce,
+        code_verifier => $code_verifier,
+        profile => $args{profile},
+        redirect_uri => $redirect_uri,
+        ( defined $args{return_url} ? ( return_url => $args{return_url} ) : () ),
+        register_if_not_exists => $args{register_if_not_exists} ? 1 : 0,
+        bind_to_profile => $args{bind_to_profile} ? 1 : 0,
+        bind_only_if_new => $args{bind_only_if_new} ? 1 : 0,
+        ( defined $args{session_id} ? ( session_id => $args{session_id} ) : () ),
+    };
+
+    cache->set_json( $self->telegram_oidc_state_cache_key($state), $ctx, $args{ttl} );
+
+    use URI::Escape qw( uri_escape );
+    my $auth_url = sprintf(
+        '%s/auth?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s&nonce=%s&code_challenge=%s&code_challenge_method=S256',
+        $self->telegram_oauth_server,
+        uri_escape($client_id),
+        uri_escape($redirect_uri),
+        uri_escape($args{scope}),
+        uri_escape($state),
+        uri_escape($nonce),
+        uri_escape($code_challenge),
+    );
+
+    return {
+        auth_url => $auth_url,
+        state => $state,
+        nonce => $nonce,
+        code_challenge => $code_challenge,
+        code_challenge_method => 'S256',
+        redirect_uri => $redirect_uri,
+        expires_in => int($args{ttl}),
+    };
+}
+
+sub telegram_oidc_start_redirect {
+    my $self = shift;
+    my %args = @_;
+
+    my $payload = $self->telegram_oidc_init(%args);
+    return undef unless $payload;
+
+    my $auth_url = $payload->{auth_url};
+    unless ( $auth_url ) {
+        report->error('Telegram OIDC auth_url is empty');
+        return undef;
+    }
+
+    if ( $ENV{SHM_TEST} ) {
+        return {
+            status => 302,
+            redirect => $auth_url,
+            %{$payload},
+        };
+    }
+
+    print_header(
+        status => 302,
+        Location => $auth_url,
+    );
+    print_json({
+        status => 302,
+        redirect => $auth_url,
+    });
+    exit 0;
+}
+
+sub telegram_oidc_client_id {
+    my $self = shift;
+    my %args = (
+        profile => 'telegram_bot',
+        @_,
+    );
+
+    my $profile = $args{profile};
+    my $config = $self->config;
+    my $profile_cfg = $config->{$profile} || {};
+
+    return $profile_cfg->{client_id}
+        || $profile_cfg->{oidc_client_id}
+        || $config->{client_id}
+        || $config->{oidc_client_id}
+        || do {
+            my $token = $profile_cfg->{token} || $config->{token} || '';
+            $token =~ /^([^:]+):/ ? $1 : undef;
+        };
+}
+
+sub telegram_oidc_client_secret {
+    my $self = shift;
+    my %args = (
+        profile => 'telegram_bot',
+        @_,
+    );
+
+    my $profile = $args{profile};
+    my $config = $self->config;
+    my $profile_cfg = $config->{$profile} || {};
+
+    return $profile_cfg->{client_secret}
+        || $profile_cfg->{oidc_client_secret}
+        || $config->{client_secret}
+        || $config->{oidc_client_secret};
+}
+
+sub telegram_oidc_exchange_code {
+    my $self = shift;
+    my %args = (
+        profile => 'telegram_bot',
+        code => undef,
+        redirect_uri => undef,
+        code_verifier => undef,
+        client_id => undef,
+        client_secret => undef,
+        @_,
+    );
+
+    for my $required ( qw(code redirect_uri) ) {
+        unless ( defined $args{$required} && $args{$required} ne '' ) {
+            report->error("Telegram OIDC $required is required");
+            return undef;
+        }
+    }
+
+    my $client_id = $args{client_id} || $self->telegram_oidc_client_id( profile => $args{profile} );
+    my $client_secret = $args{client_secret} || $self->telegram_oidc_client_secret( profile => $args{profile} );
+
+    unless ( $client_id && $client_secret ) {
+        report->error('Telegram OIDC client_id/client_secret is not configured');
+        return undef;
+    }
+
+    use URI::Escape qw( uri_escape );
+
+    my %form = (
+        grant_type => 'authorization_code',
+        code => $args{code},
+        redirect_uri => $args{redirect_uri},
+        client_id => $client_id,
+    );
+    $form{code_verifier} = $args{code_verifier} if defined $args{code_verifier} && $args{code_verifier} ne '';
+
+    my $content = join '&', map {
+        uri_escape($_) . '=' . uri_escape( defined $form{$_} ? $form{$_} : '' )
+    } sort keys %form;
+
+    my $credentials = encode_base64("$client_id:$client_secret", '');
+
+    my $response = $self->http_transport->http(
+        method => 'post',
+        url => $self->telegram_oauth_server . '/token',
+        content_type => 'application/x-www-form-urlencoded',
+        headers => {
+            Accept => 'application/json',
+            Authorization => "Basic $credentials",
+        },
+        content => $content,
+    );
+
+    unless ( $response->is_success ) {
+        my $body = $response->decoded_content;
+        my $json = decode_json($body);
+        my $error = ref $json eq 'HASH' ? ( $json->{error_description} || $json->{error} || $body ) : $body;
+        report->error("Telegram OIDC token exchange failed: $error");
+        return undef;
+    }
+
+    my $json = decode_json( $response->decoded_content );
+    unless ( ref $json eq 'HASH' && $json->{id_token} ) {
+        report->error('Telegram OIDC token response has no id_token');
+        return undef;
+    }
+
+    return $json;
+}
+
+sub telegram_oidc_jwks {
+    my $self = shift;
+
+    state $cache = {
+        fetched_at => 0,
+        keys => [],
+    };
+
+    my $ttl = 3600;
+    if ( time - $cache->{fetched_at} < $ttl && ref $cache->{keys} eq 'ARRAY' && @{ $cache->{keys} } ) {
+        return $cache->{keys};
+    }
+
+    my $response = $self->http_transport->http(
+        method => 'get',
+        url => $self->telegram_oauth_server . '/.well-known/jwks.json',
+    );
+    unless ( $response->is_success ) {
+        report->error('Telegram OIDC jwks request failed');
+        return [];
+    }
+
+    my $json = decode_json( $response->decoded_content ) || {};
+    my $keys = $json->{keys};
+
+    unless ( ref $keys eq 'ARRAY' && @$keys ) {
+        report->error('Telegram OIDC jwks response is invalid');
+        return [];
+    }
+
+    $cache->{fetched_at} = time;
+    $cache->{keys} = $keys;
+
+    return $cache->{keys};
+}
+
+sub verify_telegram_oidc_id_token {
+    my $self = shift;
+    my %args = (
+        profile => 'telegram_bot',
+        id_token => undef,
+        nonce => undef,
+        @_,
+    );
+
+    my $id_token = $args{id_token};
+    return undef unless $id_token;
+
+    my ($header_b64) = split /\./, $id_token;
+    my $header = decode_json( decode_base64url( $header_b64 ) ) || {};
+    my $kid = $header->{kid};
+
+    my $client_id = $self->telegram_oidc_client_id( profile => $args{profile} );
+    unless ( $client_id ) {
+        report->error('Telegram OIDC client_id is not configured');
+        return undef;
+    }
+
+    my $jwks = $self->telegram_oidc_jwks;
+    my @keys = grep { ref $_ eq 'HASH' && ( !$kid || ( $_->{kid} || '' ) eq $kid ) } @{ $jwks || [] };
+    @keys = @{ $jwks || [] } unless @keys;
+
+    my $claims;
+    for my $jwk ( @keys ) {
+        next unless ref $jwk eq 'HASH';
+
+        my $decoded;
+        my $ok = eval {
+            $decoded = jwt_decode(
+                token => $id_token,
+                key => $jwk,
+                accepted_alg => ['RS256'],
+                verify_exp => 0,
+                verify_iat => 0,
+                verify_nbf => 0,
+            );
+            1;
+        };
+
+        if ( $ok ) {
+            $claims = $decoded;
+            last;
+        }
+    }
+
+    unless ( ref $claims eq 'HASH' ) {
+        report->error('Telegram OIDC id_token signature verification failed');
+        return undef;
+    }
+
+    unless ( ( $claims->{iss} || '' ) eq 'https://oauth.telegram.org' ) {
+        report->error('Telegram OIDC id_token has invalid iss');
+        return undef;
+    }
+
+    my $aud = $claims->{aud};
+    my $aud_ok = 0;
+    if ( ref $aud eq 'ARRAY' ) {
+        $aud_ok = scalar grep { defined $_ && "$_" eq "$client_id" } @$aud;
+    } else {
+        $aud_ok = defined $aud && "$aud" eq "$client_id";
+    }
+    unless ( $aud_ok ) {
+        report->error('Telegram OIDC id_token has invalid aud');
+        return undef;
+    }
+
+    my $now = time;
+    if ( !$claims->{exp} || $claims->{exp} < $now ) {
+        report->error('Telegram OIDC id_token is expired');
+        return undef;
+    }
+
+    if ( $claims->{iat} && $claims->{iat} > $now + 60 ) {
+        report->error('Telegram OIDC id_token has invalid iat');
+        return undef;
+    }
+
+    if ( defined $args{nonce} && $args{nonce} ne '' ) {
+        unless ( defined $claims->{nonce} && $claims->{nonce} eq $args{nonce} ) {
+            report->error('Telegram OIDC id_token has invalid nonce');
+            return undef;
+        }
+    }
+
+    return $claims;
+}
+
 sub process_message {
     my $self = shift;
     my %args = (
@@ -589,7 +1140,7 @@ sub process_message {
     $self->{webhook} = 1;
     $self->{deny_answer_direct} = 1;
 
-    logger->debug('REQUEST:', \%args );
+    logger->debug('REQUEST from Telegram:', \%args );
     $self->res( \%args );
 
     # Set the chat_id from the message because it is unknown to new clients
@@ -599,6 +1150,15 @@ sub process_message {
     $self->{chat_id} = $chat_id if $chat_id;
 
     $self->profile( $args{tg_profile} || $args{template} );
+
+    unless ( $self->verify_telegram_secret ) {
+        return {
+            method => 'sendMessage',
+            chat_id => $self->{chat_id},
+            parse_mode => 'MarkdownV2',
+            text => "Webhook verification failed",
+        }
+    }
 
     my $template = $self->template( $args{template} );
     unless ( $template ) {
@@ -640,8 +1200,15 @@ sub process_message {
     my $exchange_rate;
     if ( my $payment = $self->message->{successful_payment} ) {
         my $money = $payment->{total_amount};
+
         if ( $payment->{currency} eq 'XTR' ) {
-            if ( $exchange_rate = $self->config->{xtr_exchange_rate} ) {
+            my $cr = $self->srv('Cloud::Currency');
+            if ( my $cr_amount = $cr->convert(
+                from => $payment->{currency},
+                amount => $money,
+            )) {
+                $money = $cr_amount;
+            } elsif ( $exchange_rate = $self->config->{xtr_exchange_rate} ) {
                 $money = $money * $exchange_rate;
             }
         }
@@ -661,7 +1228,7 @@ sub process_message {
         return {} unless $user;
         $user->set_settings({
             telegram => {
-                $self->{profile} => {
+                $self->profile_name() => {
                     status => $my_chat_member->{new_chat_member}->{status},
                 },
             }
@@ -675,10 +1242,9 @@ sub process_message {
     my ( $cmd, @args ) = $self->cmd;
 
     if ( $cmd eq '/start' && $args[0] ) {
-        use MIME::Base64;
         use URI::Escape;
         my %start_args;
-        for my $pair ( split /&/, MIME::Base64::decode_base64url( $args[0] ) ) {
+        for my $pair ( split /&/, decode_base64url( $args[0] ) ) {
             my ( $key, $value ) = split ( /=/, $pair );
             $start_args{ $key } = uri_unescape( $value ) if defined $key && defined $value;
             $self->start_args( %start_args );
@@ -701,6 +1267,15 @@ sub process_message {
         cmd => $cmd,
     );
 
+    if ( my $cb = $self->get_callback_query ) {
+        $self->http( 'answerCallbackQuery',
+            data => {
+                callback_query_id => $cb->{id},
+            },
+        );
+    }
+
+    return {};
     # Reply directly for only first response
     return get_last_object( $response );
 }
@@ -761,6 +1336,8 @@ sub exec_template {
     return \@ret;
 }
 
+sub api { shift->tg_api( @_ ) };
+
 sub tg_api {
     my $self = shift;
     my %args = (
@@ -781,9 +1358,9 @@ sub tg_api {
 
     if ( blessed $response ) {
         if ( $response->header('content-type') =~ /application\/json/i ) {
-            $self->{response} = decode_json( $response->decoded_content );
+            $self->response( decode_json( $response->decoded_content ) );
         } else {
-            $self->{response} = $response->decoded_content;
+            $self->response( $response->decoded_content );
         }
     }
 
@@ -827,9 +1404,10 @@ sub get_script {
         task => $self->{task} || undef,
         vars => {
             tg => sub { $self },
+            telegram => sub { $self },
             cmd => $cmd,
             message => $self->message,
-            response => sub { $self->{response} },
+            response => sub { $self->response },
             callback_query => $self->get_callback_query || {},
             args => $args{args},
             start_args => \%start_args,
@@ -848,7 +1426,7 @@ sub get_data_from_storage {
     my $self = shift;
     my $name = shift;
 
-    my $data = get_service('storage')->read(
+    my $data = $self->srv('storage')->read(
         name => $name,
         decode_json => 0,
     );
@@ -890,7 +1468,8 @@ sub uploadPhotoFromStorage {
     return undef unless $data;
 
     if ( delete $args{format} eq 'qr_code_png' ) {
-        $data = qx(echo "$data" | qrencode -t PNG -o -);
+        my $result = qrencode($data, format => 'PNG');
+        $data = $result->{data} if $result->{success};
     }
 
     return $self->uploadPhoto(
@@ -912,7 +1491,8 @@ sub printQrCode {
     return undef unless $data;
 
     if ( delete $args{format} eq 'qr_code_png' ) {
-        $data = qx(echo "$data" | qrencode -t PNG -o -);
+        my $result = qrencode($data, format => 'PNG');
+        $data = $result->{data} if $result->{success};
     }
 
     return $self->uploadPhoto(
@@ -920,6 +1500,26 @@ sub printQrCode {
         %{ delete $args{parameters} || {} },
         %args,
     );
+}
+
+sub smart_message_id {
+    my $self = shift;
+    my $message_id;
+
+    if ( my $id = $self->message->{message_id} ) {
+        $message_id = $id;
+    } elsif ( my $cache = $self->response_from_cache( cleanup => 1 ) ) {
+        $message_id = $cache->{result}->{message_id};
+    }
+    return $message_id;
+}
+
+
+sub shmDeletePreviousMessage {
+    my $self = shift;
+    my $message_id = $self->smart_message_id;
+
+    return $message_id ? $self->deleteMessage( message_id => $message_id ) : undef;
 }
 
 sub shmRedirectCallback {
@@ -940,7 +1540,6 @@ sub shmRegister {
         callback_data => undef,
         error => undef,
         partner_id => undef,
-        user_login => undef,
         settings => {},
         get_smart_args(@_),
     );
@@ -960,8 +1559,8 @@ sub shmRegister {
     my $telegram_user_id = $tg_user->{id};
 
     my $user = $self->user->reg(
-        login => $args{user_login} || get_shm_login( $telegram_user_id ),
-        password => passgen(),
+        login => $self->get_shm_login( $telegram_user_id ),
+        login_type => 'telegram',
         full_name => sprintf("%s %s", $tg_user->{first_name}, $tg_user->{last_name} ),
         settings => {
             %{ $args{settings} || {} },
@@ -974,7 +1573,7 @@ sub shmRegister {
                 language_code => $tg_user->{language_code},
                 is_premium => $tg_user->{is_premium},
                 chat_id => $self->chat_id, # for backward compatible
-                $self->{profile} => {
+                $self->profile_name() => {
                     chat_id => $self->chat_id,
                     status => 'member',
                 },
@@ -1061,19 +1660,18 @@ sub shmServiceDelete {
         @_,
     );
 
-    my $us = get_service('us')->id( $args{usi} );
+    my $us = $self->srv('us')->id( $args{usi} );
 
-    if ( $us ) {
-        $us->delete();
+    if ( $us && $us->delete( force => 1 ) ) {
         return $self->exec_template(
             get_cmd_args( $args{callback_data} ),
         );
-    } else {
-        if ( $args{error} ) {
-            return $self->sendMessage(
-                text => $args{error},
-            );
-        }
+    }
+
+    if ( $args{error} ) {
+        return $self->sendMessage(
+            text => $args{error},
+        );
     }
 
     return {};
@@ -1082,31 +1680,28 @@ sub shmServiceDelete {
 sub webapp_auth {
     my $self = shift;
     my %args = (
-        uid => undef,
         initData => undef,
         profile => 'telegram_bot',
         @_,
     );
 
-    unless ( $args{initData} && $args{uid} ) {
+    unless ( $args{initData} ) {
+        logger->error("Telegram WebApp auth error: initData required");
         report->error("bad request");
+        $self->set_user_fail_attempt( 'webapp_auth', 3600, $self->telegram_ips ); # 5 fails/hour
         return undef;
     }
-
-    if ( $self->user->id($args{uid})) {
-        switch_user( $args{uid} );
-    } else {
-        logger->error("Telegram WebApp auth error: user not found");
-        return undef;
-    }
-
-    $self->profile( $args{profile} );
 
     my %in = CGI->new( $args{initData} )->Vars();
 
-    my $user = decode_json( $in{user} );
-    if ( $user->{id} ne $self->user_tg_settings->{user_id} ) {
-        report->error("Telegram WebApp auth error: user_id doesn't match");
+    # Step 1: verify Telegram signature BEFORE any user lookup or switch
+    $self->profile( $args{profile} );
+
+    my $token = $self->token;
+    unless ( $token ) {
+        logger->error("Telegram WebApp auth error: bot token is not configured for profile $args{profile}");
+        report->error('Telegram WebApp auth error');
+        $self->set_user_fail_attempt( 'webapp_auth', 3600, $self->telegram_ips );
         return undef;
     }
 
@@ -1115,17 +1710,436 @@ sub webapp_auth {
     my $data_check_string = join("\n", @arr );
 
     use Digest::SHA qw(hmac_sha256 hmac_sha256_hex);
-    my $secret_key = hmac_sha256( $self->token, "WebAppData" );
-    my $hex = hmac_sha256_hex( $data_check_string, $secret_key);
+    my $secret_key = hmac_sha256( $token, "WebAppData" );
+    my $hex = hmac_sha256_hex( $data_check_string, $secret_key );
 
     unless ( $hex eq $hash ) {
+        logger->error("Telegram WebApp auth error: incorrect token for profile $args{profile}");
         report->error('Telegram WebApp auth error');
+        $self->set_user_fail_attempt( 'webapp_auth', 3600, $self->telegram_ips ); # 5 fails/hour
+        return undef;
+    }
+
+    # Step 2: check auth_date freshness (prevent replay attacks)
+    if ( !$in{auth_date} || time - $in{auth_date} > 86400 ) {
+        logger->error("Telegram WebApp auth error: auth_date is missing or expired");
+        report->error('Telegram WebApp auth error');
+        $self->set_user_fail_attempt( 'webapp_auth', 3600, $self->telegram_ips );
+        return undef;
+    }
+
+    # Step 3: decode user and validate id is non-empty
+    my $tg_user = decode_json( $in{user} );
+
+    unless ( $tg_user && defined $tg_user->{id} && $tg_user->{id} ne '' ) {
+        logger->error("Telegram WebApp auth error: user id is missing or empty");
+        report->error('Telegram WebApp auth error');
+        $self->set_user_fail_attempt( 'webapp_auth', 3600, $self->telegram_ips );
+        return undef;
+    }
+
+    # Step 4: find the user AFTER signature is verified
+    my $login = $self->find_user_by_tg( $tg_user );
+    unless ( $login ) {
+        logger->error("Telegram WebApp auth error: user not found");
+        $self->set_user_fail_attempt( 'webapp_auth', 3600, $self->telegram_ips ); # 5 fails/hour
         return undef;
     }
 
     return {
-        session_id => $self->srv('sessions')->add(),
+        session_id => $login->user->srv('sessions')->add(
+            settings => { account => { login => $login->get_login, type => $login->get_type } },
+        ),
     };
+}
+
+sub web_auth {
+    my $self = shift;
+    my %args = (
+        profile => 'telegram_bot',
+        register_if_not_exists => 0,
+        bind_to_profile => 0,
+        bind_only_if_new => 0,
+        session_id => undef,
+        @_,
+    );
+
+    my $uid;
+    if ( $args{bind_to_profile} ) {
+        my $session = validate_session( session_id => $args{session_id} );
+        unless ( $session ) {
+            report->status( 401 );
+            report->error('A valid session is required to bind a Telegram account');
+            return undef;
+        }
+        $uid = $session->user_id;
+    }
+
+    my $profile = $args{profile};
+
+    my @parameters = qw( id first_name last_name username photo_url auth_date hash );
+
+    my %in;
+    use URI::Escape;
+
+    if ( $args{expected_state} && defined $args{state} && $args{state} ne $args{expected_state} ) {
+        report->error('Telegram OIDC state mismatch');
+        $self->set_user_fail_attempt( 'web_auth', 3600, $self->telegram_ips );
+        return undef;
+    }
+
+    if ( $args{code} ) {
+        my $tokens = $self->telegram_oidc_exchange_code(
+            profile => $profile,
+            code => $args{code},
+            redirect_uri => $args{redirect_uri},
+            code_verifier => $args{code_verifier},
+            client_id => $args{client_id},
+            client_secret => $args{client_secret},
+        );
+
+        unless ( $tokens ) {
+            $self->set_user_fail_attempt( 'web_auth', 3600, $self->telegram_ips );
+            return undef;
+        }
+
+        $args{id_token} = $tokens->{id_token};
+    }
+
+    if ( $args{id_token} ) {
+        my $claims = $self->verify_telegram_oidc_id_token(
+            profile => $profile,
+            id_token => $args{id_token},
+            nonce => $args{nonce},
+        );
+
+        unless ( $claims ) {
+            $self->set_user_fail_attempt( 'web_auth', 3600, $self->telegram_ips );
+            return undef;
+        }
+
+        my $name = $claims->{name} || '';
+        my ( $first_name, $last_name ) = split /\s+/, $name, 2;
+
+        $in{id} = $claims->{id} || $claims->{sub};
+        $in{username} = $claims->{preferred_username} if defined $claims->{preferred_username};
+        $in{first_name} = defined $claims->{given_name} ? $claims->{given_name} : ( $first_name || '' );
+        $in{last_name} = defined $claims->{family_name} ? $claims->{family_name} : ( $last_name || '' );
+        $in{photo_url} = $claims->{picture} if defined $claims->{picture};
+        $in{auth_date} = $claims->{iat} || time;
+    } elsif (grep { defined $args{$_} } qw(id auth_date hash)) {
+        for my $k (@parameters) {
+            $in{$k} = uri_unescape($args{$k}) if defined $args{$k};
+        }
+    } elsif ($args{query}) {
+        for my $pair (split /&/, $args{query}) {
+            my ($k, $v) = split /=/, $pair, 2;
+            $in{$k} = uri_unescape($v);
+        }
+    }
+
+    unless ( $args{id_token} ) {
+        my $hash = delete $in{hash};
+
+        unless ( defined $in{id} && $in{id} ne '' ) {
+            logger->error("Telegram auth error: user id is missing or empty");
+            report->error('Telegram auth error');
+            $self->set_user_fail_attempt( 'web_auth', 3600, $self->telegram_ips );
+            return undef;
+        }
+
+        my @arr = map { "$_=$in{$_}" } sort keys %in;
+        my $data_check_string = join("\n", @arr);
+
+        my $token = $self->config->{ $profile }->{token} // $self->config->{token};
+        unless ( $token ) {
+            logger->error("Telegram auth error: bot token is not configured for profile $profile");
+            report->error('Telegram auth error');
+            $self->set_user_fail_attempt( 'web_auth', 3600, $self->telegram_ips );
+            return undef;
+        }
+
+        use Digest::SHA qw(sha256 hmac_sha256_hex);
+        my $secret_key = sha256( $token );
+
+        my $hex = hmac_sha256_hex(encode_utf8($data_check_string), $secret_key);
+
+        unless ($hex eq $hash) {
+            report->error('Telegram auth error');
+            $self->set_user_fail_attempt( 'web_auth', 3600, $self->telegram_ips ); # 5 fails/hour
+            return undef;
+        }
+
+        if (time - $in{auth_date} > 86400) {
+            report->error("Telegram auth data too old");
+            return undef;
+        }
+    }
+
+    if ( $uid && $self->user->id($uid) ) {
+        switch_user( $uid );
+        if ( $args{bind_to_profile} ) {
+            if ( $args{bind_only_if_new} ) {
+                my $existing_user = $self->find_user_by_tg( \%in );
+                if ( $existing_user && $existing_user->{user_id} ne $uid ) {
+                    return { error => 'Telegram account already exists' };
+                }
+            }
+
+            my $login = $in{id};
+            unless ( $self->user->logins->id( $login, ['telegram'] ) ) {
+                $self->user->logins->add( login => $login, type => 'telegram' );
+            }
+            my $settings = $self->user->settings->{telegram} || {};
+            if ( !$settings->{user_id} ) {
+                $self->user->set_json(
+                    'settings', {
+                        telegram => {
+                            user_id    => $in{id},
+                            username   => $in{username},
+                            login      => $in{username},
+                            first_name => $in{first_name} || '',
+                            last_name  => $in{last_name}  || '',
+                            chat_id    => $in{id},
+                            $profile   => {
+                                chat_id => $in{id},
+                                status  => 'member',
+                            },
+                        },
+                    },
+                );
+                return { msg => 'Successfully bound to Telegram' };
+            } else {
+                return { error => 'Already bound to Telegram' };
+            }
+        }
+    }
+
+    my $chat_id = $in{id};
+
+    my $login = $self->find_user_by_tg( \%in );
+    my $user = $login;
+
+    if ( !$user && $args{register_if_not_exists} ) {
+        $user = $self->user->reg(
+            login      => $self->get_shm_login( $in{id} ),
+            login_type => 'telegram',
+            password   => passgen(),
+            full_name  => sprintf("%s %s", $in{first_name} || '', $in{last_name} || ''),
+            settings   => {
+                %{ $args{settings} || {} },
+                telegram => {
+                    user_id         => $chat_id,
+                    username        => $in{username},
+                    login           => $in{username},
+                    first_name      => $in{first_name} || '',
+                    last_name       => $in{last_name} || '',
+                    chat_id         => $chat_id,
+                    $profile => {
+                        chat_id => $chat_id,
+                        status  => 'member',
+                    },
+                },
+            },
+            $args{partner_id} ? ( partner_id => $args{partner_id} ) : (),
+        );
+
+        unless ( $user ) {
+            # Registration can fail if the account was created concurrently
+            # (e.g. duplicate request/race condition) between the lookup above
+            # and the reg() call. Re-check before giving up.
+            $login = $self->find_user_by_tg( \%in );
+            $user = $login;
+        }
+    }
+
+    if ( !$user ) {
+        logger->error("Telegram WebApp auth error: user not found");
+        $self->set_user_fail_attempt( 'web_auth', 3600, $self->telegram_ips ); # 5 fails/hour
+        return undef;
+    }
+
+    return {
+        session_id => $user->srv('sessions')->add(
+            $login ? ( settings => { account => { login => $login->get_login, type => $login->get_type } } ) : (),
+        ),
+    };
+}
+
+sub web_auth_callback {
+    my $self = shift;
+    my %args = (
+        profile => 'telegram_bot',
+        register_if_not_exists => 0,
+        bind_to_profile => 0,
+        bind_only_if_new => 0,
+        @_,
+    );
+
+    if ( $args{state} ) {
+        my $ctx = cache->get_json( $self->telegram_oidc_state_cache_key( $args{state} ) );
+        if ( ref $ctx eq 'HASH' ) {
+            $args{expected_state} //= $ctx->{state};
+            $args{code_verifier} //= $ctx->{code_verifier};
+            $args{nonce} //= $ctx->{nonce};
+            $args{profile} = $ctx->{profile} if !defined $args{profile} || $args{profile} eq '' || $args{profile} eq 'telegram_bot';
+            $args{redirect_uri} //= $ctx->{redirect_uri};
+            $args{return_url} //= $ctx->{return_url} if defined $ctx->{return_url};
+            $args{register_if_not_exists} = $ctx->{register_if_not_exists} if !$args{register_if_not_exists} && defined $ctx->{register_if_not_exists};
+            $args{bind_to_profile} = $ctx->{bind_to_profile} if !$args{bind_to_profile} && defined $ctx->{bind_to_profile};
+            $args{bind_only_if_new} = $ctx->{bind_only_if_new} if !$args{bind_only_if_new} && defined $ctx->{bind_only_if_new};
+            $args{session_id} //= $ctx->{session_id} if defined $ctx->{session_id};
+
+            cache->delete( $self->telegram_oidc_state_cache_key( $args{state} ) );
+        }
+    }
+
+    # If redirect_uri was not explicitly provided, use current callback URL.
+    # This allows setting Telegram redirect_uri directly to /shm/v1/telegram/web/callback.
+    $args{redirect_uri} ||= $self->telegram_web_callback_url;
+
+    my $result = $self->web_auth( %args );
+
+    my $return_url = $args{return_url};
+    if ( $return_url && !$self->is_safe_return_url($return_url) ) {
+        logger->error("web_auth_callback: unsafe return_url rejected: $return_url");
+        report->error('Invalid redirect URL');
+        return undef;
+    }
+    return $result unless $return_url;
+
+    my %query;
+    if ( ref $result eq 'HASH' && $result->{session_id} ) {
+        %query = (
+            tg_status => 'success',
+        );
+    } elsif ( ref $result eq 'HASH' && $result->{error} eq 'Telegram account already exists' ) {
+        %query = (
+            tg_status => 'already_exists',
+            error => $result->{error} || 'Telegram account already exists',
+        );
+    } elsif ( ref $result eq 'HASH' && ( $result->{error} || '' ) =~ /Already\s+bound/i ) {
+        %query = (
+            tg_status => 'already_bound',
+            error => $result->{error},
+        );
+    } elsif ( ref $result eq 'HASH' && ( $result->{msg} || '' ) =~ /Successfully\s+bound/i ) {
+        %query = (
+            tg_status => 'success',
+            msg => $result->{msg},
+        );
+    } elsif ( ref $result eq 'HASH' && $result->{error} ) {
+        %query = (
+            tg_status => 'error',
+            error => $result->{error},
+        );
+    } else {
+        my ( $err ) = report->errors;
+        %query = (
+            tg_status => 'error',
+            error => $err || 'Telegram auth failed',
+        );
+    }
+
+    my $qs = to_query_string(\%query) || '';
+
+    my $sep = $return_url =~ /\?/ ? '&' : '?';
+    my $finish_url = $return_url . ($qs ? $sep . $qs : '');
+
+    # Session can no longer travel in the redirect URL (leaks via browser
+    # history/Referer/logs), so hand it to the client as an HttpOnly cookie
+    # on the 302 response instead.
+    my $cookie = ( ref $result eq 'HASH' && $result->{session_id} )
+        ? session_id_cookie( $result->{session_id} )
+        : undef;
+
+    my $redirect_payload = {
+        status => 302,
+        redirect => $finish_url,
+        %query,
+        $cookie ? ( session_cookie => $cookie->as_string ) : (),
+    };
+
+    if ( $ENV{SHM_TEST} ) {
+        return $redirect_payload;
+    }
+
+    print_header(
+        status => 302,
+        Location => $finish_url,
+        $cookie ? ( cookie => $cookie ) : (),
+    );
+    print_json($redirect_payload);
+    exit 0;
+}
+
+sub delete_webhook {
+    my $self = shift;
+    my %args = (
+        token => undef,
+        @_,
+    );
+
+    my $delete_webhook = $self->http_transport->http(
+        method => 'get',
+        url => sprintf('%s/bot%s/deleteWebhook?drop_pending_updates=True', $self->telegram_server, $args{token}),
+    );
+
+    unless ( $delete_webhook->is_success ) {
+        logger->error( $delete_webhook->decoded_content );
+    }
+
+    return $delete_webhook->decoded_content;
+}
+
+sub set_webhook {
+    my $self = shift;
+    my %args = (
+        method => 'post',
+        content_type => 'application/json; charset=utf-8',
+        url => undef,
+        token => undef,
+        secret => undef,
+        template_id => undef,
+        tg_profile => undef,
+        allowed_updates => undef,
+        @_,
+    );
+
+    my $method = delete $args{method};
+
+    $self->delete_webhook( token => $args{token} );
+
+    my $bot = $args{template_id};
+    $bot .=  "?tg_profile=$args{tg_profile}" if $args{tg_profile};
+    my $content = {
+        secret_token => $args{secret},
+        url => sprintf('%s/shm/v1/telegram/bot/%s', $args{url}, $bot),
+        allowed_updates => $args{allowed_updates} // [
+            'message',
+            'inline_query',
+            'callback_query',
+            'pre_checkout_query',
+            'my_chat_member',
+        ]
+    };
+
+    my $set_webhook = $self->http_transport->http(
+        method => $method,
+        url => sprintf('%s/bot%s/setWebhook', $self->telegram_server, $args{token}),
+        content_type => $args{content_type},
+        content => encode_json( $content ),
+    );
+
+    logger->dump('Send to TG', $set_webhook->request );
+    logger->dump('Answer from TG', $set_webhook->decoded_content );
+
+    unless ( $set_webhook->is_success ) {
+        my $message = $set_webhook->decoded_content;
+        logger->error( $message );
+    }
+
+    return $set_webhook->decoded_content;
 }
 
 1;

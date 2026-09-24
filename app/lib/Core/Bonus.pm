@@ -12,21 +12,28 @@ sub structure {
         id => {
             type => 'number',
             key => 1,
+            title => 'id бонуса',
         },
         user_id => {
             type => 'number',
             auto_fill => 1,
+            title => 'id пользователя',
         },
         date => {
             type => 'now',
+            title => 'дата создания бонуса',
         },
         bonus => {
             type => 'number',
             required => 1,
+            title => 'кол-во бонусов',
+            use_for_stats => 1,
+            stats_use_when_add => 1,
         },
         comment => {
             type => 'json',
             value => undef,
+            title => 'комментарий',
         },
     }
 }

@@ -5,6 +5,7 @@ use base qw(Exporter);
 
 our @EXPORT = qw(
     SUCCESS
+    SKIP
     FAIL
 
     STATUS_INIT
@@ -17,10 +18,11 @@ our @EXPORT = qw(
 
     EVENT_CREATE
     EVENT_BLOCK
+    EVENT_BLOCK_FORCE
     EVENT_REMOVE
     EVENT_PROLONGATE
     EVENT_ACTIVATE
-    EVENT_UPDATE_CHILD_STATUS
+    EVENT_ACTIVATE_FORCE
     EVENT_CHILD_PREFIX
     EVENT_NOT_ENOUGH_MONEY
     EVENT_CHANGED
@@ -29,12 +31,19 @@ our @EXPORT = qw(
     TASK_NEW
     TASK_SUCCESS
     TASK_FAIL
+    TASK_DELAYED
     TASK_STUCK
     TASK_PAUSED
+    TASK_SKIPPED
+    TASK_DELETED
+
+    GROUP_ID_LOCAL
+    GROUP_ID_MAIL
 );
 
 use constant {
     SUCCESS => 1,
+    SKIP => 2,
     FAIL => 0,
 };
 
@@ -57,22 +66,32 @@ use constant {
 };
 
 use constant {
-    EVENT_CREATE => 'create',
-    EVENT_NOT_ENOUGH_MONEY => 'not_enough_money',
-    EVENT_BLOCK => 'block',
-    EVENT_REMOVE => 'remove',
-    EVENT_PROLONGATE => 'prolongate',
-    EVENT_ACTIVATE => 'activate',
-    EVENT_CHANGED => 'changed',
-    EVENT_CHANGED_TARIFF => 'changed_tariff',
+    EVENT_CREATE => 'CREATE',
+    EVENT_NOT_ENOUGH_MONEY => 'NOT_ENOUGH_MONEY',
+    EVENT_BLOCK => 'BLOCK',
+    EVENT_BLOCK_FORCE => 'BLOCK FORCE',
+    EVENT_REMOVE => 'REMOVE',
+    EVENT_PROLONGATE => 'PROLONGATE',
+    EVENT_ACTIVATE => 'ACTIVATE',
+    EVENT_ACTIVATE_FORCE => 'ACTIVATE FORCE',
+    EVENT_CHANGED => 'CHANGED',
+    EVENT_CHANGED_TARIFF => 'CHANGED_TARIFF',
 };
 
 use constant {
     TASK_NEW => 'NEW',
     TASK_SUCCESS => 'SUCCESS',
     TASK_FAIL => 'FAIL',
+    TASK_DELAYED => 'DELAYED',
     TASK_STUCK => 'STUCK',
     TASK_PAUSED => 'PAUSED',
+    TASK_SKIPPED => 'SKIPPED',
+    TASK_DELETED => 'DELETED',
+};
+
+use constant {
+    GROUP_ID_LOCAL => 1,
+    GROUP_ID_MAIL => 2,
 };
 
 1;

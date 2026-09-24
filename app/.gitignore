@@ -1,3 +1,5 @@
-*.pl
+/*.pl
+*.swp
 data/
 test
+version.json

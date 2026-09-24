@@ -19,6 +19,7 @@ our @EXPORT = qw(
     query_select
     query_for_order
     query_for_filtering
+    prepare_query_for_filtering
     quote
     res_by_arr
     insert_id
@@ -28,6 +29,12 @@ our @EXPORT = qw(
     min
     max
     count
+    remove_protected_fields
+);
+
+our @EXPORT_OK = qw(
+    clean_query_args
+    is_safe_identifier
 );
 
 use Core::Utils qw(
@@ -60,8 +67,7 @@ sub db_connect {
         attr => {
             RaiseError => 0,
             AutoCommit => 0,
-            mysql_auto_reconnect => 1,
-            mysql_enable_utf8mb4 => $ENV{SHM_TEST} ? 0 : 1,
+            mysql_enable_utf8mb4 => 1,
             InactiveDestroy => 1,
         },
         @_,
@@ -83,7 +89,13 @@ sub db_connect {
 sub configure {
     my $dbh = shift;
 
-    $dbh->do( sprintf( "SET time_zone = '%s'", $ENV{TZ}) );
+    my @sql = (
+        "SET transaction_isolation = 'READ-COMMITTED'",
+        "SET sort_buffer_size = 256000000",
+        "SET time_zone = '$ENV{TZ}'",
+    );
+
+    $dbh->do( $_ ) for @sql;
 }
 
 sub dbh {
@@ -112,6 +124,18 @@ sub dbh_new {
     return $child_dbh;
 }
 
+sub dbh_auto_commit {
+    my $self = shift;
+    my $local = get_service('config')->local;
+
+    if ( my $dbh = $local->{dbh_auto_commit} ) {
+        return $dbh if $dbh->ping;
+        $dbh->disconnect;
+    }
+
+    return $local->{dbh_auto_commit} = $self->dbh_new( AutoCommit => 1, InactiveDestroy => 0 );
+}
+
 sub table_allow_insert_key { return 0 };
 
 sub insert_id {
@@ -137,15 +161,33 @@ sub do {
     $self->log( $query, \@args );
 
     my $res = $self->dbh->do( $query, undef, @args ) or do {
-        logger->warning( $self->dbh->errstr );
+        logger->error( sprintf "SQL QUERY: %s [%s], ERROR: %s",
+            $query,
+            join(',', @args ),
+            $self->dbh->errstr,
+        );
         return undef;
     };
     return $res eq '0E0' ? 0 : $res;
 }
 
+sub add_post_commit_callback {
+    my $self = shift;
+    my $cb   = shift;
+    push @{ get_service('config')->local->{_post_commit_callbacks} ||= [] }, $cb;
+}
+
 sub commit {
     my $self = shift;
-    return $self->dbh->commit unless $ENV{SHM_TEST};
+    return if $ENV{SHM_TEST};
+    my $result = $self->dbh->commit;
+
+    my $callbacks = delete get_service('config')->local->{_post_commit_callbacks};
+    for my $cb ( @{ $callbacks || [] } ) {
+        eval { $cb->() };
+        logger->warning("Post-commit callback failed: $@") if $@;
+    }
+    return $result;
 }
 
 sub rollback {
@@ -230,7 +272,7 @@ sub convert_sql_structure_data {
         }
     }
     else {
-        logger->fatal('Unknown type of data');
+        logger->fatal('Unknown type of data', $self);
     }
 }
 
@@ -242,6 +284,9 @@ sub query_for_order {
         @_,
     );
 
+    return undef unless $args{sort_direction};
+    return undef unless uc( $args{sort_direction} ) =~ /^(ASC|DESC)$/;
+
     return undef unless $self->can('structure');
     my %structure = %{ $self->structure };
 
@@ -251,36 +296,206 @@ sub query_for_order {
     return [ $field => $args{sort_direction} ];
 }
 
+sub prepare_query_for_filtering {
+    my $data = shift;
+
+    return {} unless ref $data eq 'HASH';
+
+    my %result;
+
+    for my $field (keys %$data) {
+        next if $field =~ /^--/;  # reject user-supplied raw SQL markers
+        my $value = $data->{$field};
+
+        # Recursively prepare logical groups so scalar refs like gt()/true
+        # are converted before SQL::Abstract receives nested conditions.
+        if ( $field =~ /^-(or|and)$/ ) {
+            if ( ref $value eq 'HASH' ) {
+                $result{$field} = prepare_query_for_filtering( $value );
+            } elsif ( ref $value eq 'ARRAY' ) {
+                my @items;
+                for my $item ( @{ $value } ) {
+                    if ( ref $item eq 'HASH' ) {
+                        push @items, prepare_query_for_filtering( $item );
+                    }
+                }
+                $result{$field} = \@items;
+            }
+            next;
+        }
+
+        if (ref $value eq 'SCALAR') {
+            if ($$value eq 'isEmpty') {
+                # Поле пустое (NULL или пустая строка)
+                next unless is_safe_identifier( $field );
+                $result{"--COALESCE($field, '')"} = '';
+            } elsif ($$value eq 'isNotEmpty') {
+                # Поле не пустое
+                next unless is_safe_identifier( $field );
+                $result{"--COALESCE($field, '')"} = { '!=' => '' };
+            } elsif ($$value eq 'isNull') {
+                # Поле равно NULL
+                $result{$field} = undef;
+            } elsif ($$value eq 'isNotNull') {
+                # Поле не равно NULL
+                $result{$field} = { '!=' => undef };
+            } elsif ($$value eq 'null') {
+                # Поле равно NULL (альтернативный синтаксис)
+                $result{$field} = undef;
+            } elsif ($$value eq 'true') {
+                # Поле равно истине (для boolean полей)
+                $result{$field} = 1;
+            } elsif ($$value eq 'false') {
+                # Поле равно лжи (для boolean полей)
+                $result{$field} = 0;
+            } elsif ($$value eq 'isTrue') {
+                # Поле истинно (поддерживает и true, и 1)
+                $result{"--LOWER($field)"} = { '-in' => [ 'true', '1' ] };
+            } elsif ($$value eq 'isFalse') {
+                # Поле ложно (поддерживает и false, и 0)
+                $result{"--LOWER($field)"} = { '-in' => [ 'false', '0' ] };
+            } elsif ($$value =~ /^(lt|gt|le|ge|eq|ne):(.*)$/) {
+                # Операторы сравнения с числами: lt:5, gt:10, le:100, etc.
+                my ($op, $val) = ($1, $2);
+                my %op_map = (
+                    'lt' => '<',
+                    'gt' => '>',
+                    'le' => '<=',
+                    'ge' => '>=',
+                    'eq' => '=',
+                    'ne' => '!=',
+                );
+                $result{$field} = { $op_map{$op} => $val };
+            } elsif ($$value =~ /^between:([^:]+):([^:]+)$/) {
+                # Оператор BETWEEN: between:10:100
+                my ($min, $max) = ($1, $2);
+                $result{$field} = { '-between' => [$min, $max] };
+            } elsif ($$value eq 'isPositive') {
+                # Поле больше нуля (положительное)
+                $result{$field} = { '>' => 0 };
+            } elsif ($$value eq 'isNegative') {
+                # Поле меньше нуля (отрицательное)
+                $result{$field} = { '<' => 0 };
+            } elsif ($$value eq 'isNonNegative') {
+                # Поле больше или равно нулю (неотрицательное)
+                $result{$field} = { '>=' => 0 };
+            } elsif ($$value eq 'isNonPositive') {
+                # Поле меньше или равно нулю (неположительное)
+                $result{$field} = { '<=' => 0 };
+            } else {
+                # Неизвестное скалярное значение - передаем как есть
+                $result{$field} = $value;
+            }
+        } elsif (ref $value eq 'HASH') {
+            # Если значение уже хеш (например, операторы SQL::Abstract) - передаем как есть
+            $result{$field} = $value;
+        } else {
+            # Обычные значения передаем как есть
+            $result{$field} = $value;
+        }
+    }
+
+    return \%result;
+}
+
 sub query_for_filtering {
     my $self = shift;
-    my %args = (
+    my $args = {
         @_,
-    );
+    };
 
     return undef unless $self->can('structure');
+
+    $args = prepare_query_for_filtering( $args );
+
     my %structure = %{ $self->structure };
 
     my %where;
 
-    for my $key ( keys %args ) {
+    for my $key ( keys %$args ) {
+        if ( $key =~ /^--(.+)$/ ) {
+            $where{ $1 } = $args->{ $key };
+            next;
+        }
+
         if ( my $field = $structure{ $key } ) {
             if ( $field->{key} || $field->{type} eq 'number' ) {
-                $args{ $key } =~s/%//g;
-                $where{ $key } = $args{ $key };
+                $args->{ $key } =~s/%//g if !ref $args->{ $key };
+                $where{ $key } = $args->{ $key };
             } elsif ( $field->{type} eq 'json' ) {
-                if ( ref $args{ $key } eq 'HASH' ) {
+                if ( ref $args->{ $key } eq 'HASH' ) {
                     # Check value in the key in a json object
-                    $where{ sprintf("%s->>'\$.%s'", $key, $_) } = $args{ $key }->{ $_ } for keys %{ $args{ $key } };
+                    for my $json_key ( keys %{ $args->{ $key } } ) {
+                        next unless is_safe_identifier( $json_key, allow_dots => 1 );
+                        my $json_value = $args->{ $key }->{ $json_key };
+                        my $field_path = sprintf("%s->>'\$.%s'", $key, $json_key);
+
+                        # Если значение является скалярной ссылкой (результат функций типа ne(), gt(), etc.)
+                        if ( ref $json_value eq 'SCALAR' ) {
+                            # Применяем prepare_query_for_filtering к значению
+                            my $prepared = prepare_query_for_filtering({ temp_field => $json_value });
+                            if ( exists $prepared->{temp_field} ) {
+                                $where{ $field_path } = $prepared->{temp_field};
+                            } else {
+                                # Если есть специальные ключи с префиксом --, обрабатываем их
+                                for my $prep_key ( keys %$prepared ) {
+                                    if ( $prep_key =~ /^--/ ) {
+                                        # Заменяем temp_field на реальный путь JSON и убираем префикс --
+                                        my $raw_key = $prep_key;
+                                        $raw_key =~ s/temp_field/$field_path/g;
+                                        $raw_key =~ s/^--//;
+                                        $where{ $raw_key } = $prepared->{ $prep_key };
+                                    } else {
+                                        $where{ $field_path } = $prepared->{ $prep_key };
+                                    }
+                                }
+                            }
+                        } else {
+                            # Обычное значение
+                            $where{ $field_path } = $json_value;
+                        }
+                    }
                 } else {
+                    if ( $args->{ $key } =~ /%/ ) {
+                        $where{ $key }{'-like'} = $args->{ $key };
+                    }
                     # Check exists key in a json object
-                    $where{ sprintf("JSON_EXTRACT(%s, '\$.%s')", $key, $args{ $key }) } = { '!=', undef };
+                    elsif ( $args->{ $key }=~s/^\!// ) {
+                        if ( is_safe_identifier( $args->{ $key }, allow_dots => 1 ) ) {
+                            $where{ sprintf("JSON_EXTRACT(%s, '\$.%s')", $key, $args->{ $key }) } = { '=', undef };
+                        }
+                    } else {
+                        if ( is_safe_identifier( $args->{ $key }, allow_dots => 1 ) ) {
+                            $where{ sprintf("JSON_EXTRACT(%s, '\$.%s')", $key, $args->{ $key }) } = { '!=', undef };
+                        }
+                    }
                 }
             } else {  # for type=(`text`, `now`, ``, ...)
-                if ( ref $args{ $key } ) {
-                    $where{ $key } = $args{ $key };
+                if ( ref $args->{ $key } ) {
+                    $where{ $key } = $args->{ $key };
                 } else {
-                    $where{ $key }{'-like'} = $args{ $key };
+                    $where{ $key }{'-like'} = $args->{ $key };
                 }
+            }
+        } elsif ( $key eq '-or' || $key eq '-and' ) {
+            my $logic_value = $args->{ $key };
+
+            if ( ref $logic_value eq 'HASH' ) {
+                my $nested = $self->query_for_filtering( %{ $logic_value } );
+                my @conditions;
+                for my $nested_key ( sort keys %{ $nested || {} } ) {
+                    push @conditions, { $nested_key => $nested->{ $nested_key } };
+                }
+                $where{ $key } = \@conditions if @conditions;
+            }
+            elsif ( ref $logic_value eq 'ARRAY' ) {
+                my @conditions;
+                for my $item ( @{ $logic_value } ) {
+                    next unless ref $item eq 'HASH';
+                    my $nested = $self->query_for_filtering( %{ $item } );
+                    push @conditions, $nested if %{ $nested || {} };
+                }
+                $where{ $key } = \@conditions if @conditions;
             }
         }
     }
@@ -303,7 +518,6 @@ sub clean_query_args {
             for my $k ( keys %{ $args } ) {
                 next if $k eq 'where';
                 unless ( exists $structure{ $k } ) {
-                    logger->debug( "Unknown field `$k` in table. Deleting");
                     delete $args->{ $k };
                 }
             }
@@ -320,13 +534,34 @@ sub clean_query_args {
                         } elsif ( $self->can( $f ) ) {
                             $args->{where}{ $f } = $self->$f;
                         }
-                        report->fatal( "`$f` required" ) unless length $args->{where}{ $f };
+                        logger->fatal( "`$f` required", $self ) unless length $args->{where}{ $f };
                     }
                     # Запрещаем обновлять ключевое поле
                     delete $args->{ $f } if exists $args->{ $f };
                 } elsif ( exists $args->{ $f } ) {
                     # Не используем ключи в insert-ах (админам можно)
-                    unless ( get_service('user')->authenticated->is_admin ) {
+                    unless ( $self->user->authenticated->is_admin ) {
+                        delete $args->{ $f } unless $self->table_allow_insert_key;
+                    }
+                }
+            }
+
+            if ( $f eq $self->get_table_key2() ) {
+                if ( $settings->{is_update} ) {
+                    unless ( $args->{where}{ $f } ) {
+                        # Добавляем во WHERE ключевое поле
+                        if ( my $id = $self->{res}->{ $f } ) {
+                            $args->{where}{ $f } = $id;
+                        } elsif ( $self->can( $f ) ) {
+                            $args->{where}{ $f } = $self->$f;
+                        }
+                        logger->fatal( "`$f` required", $self ) unless length $args->{where}{ $f };
+                    }
+                    # Запрещаем обновлять ключевое поле
+                    delete $args->{ $f } if exists $args->{ $f };
+                } elsif ( exists $args->{ $f } ) {
+                    # Не используем ключи в insert-ах (админам можно)
+                    unless ( $self->user->authenticated->is_admin ) {
                         delete $args->{ $f } unless $self->table_allow_insert_key;
                     }
                 }
@@ -339,7 +574,7 @@ sub clean_query_args {
                     } elsif ( $self->can( $f ) ) {
                         $args->{ $f } = $self->$f;
                     }
-                    report->fatal( "Can't get `$f` from self" ) unless $args->{ $f };
+                    logger->fatal( "Can't get `$f` from self", $self ) unless length $args->{ $f };
                 }
                 next;
             }
@@ -349,23 +584,23 @@ sub clean_query_args {
 
             if ( $v->{auto_fill} ) { # получаем автоматически
                 if ( exists $self->{ $f } ) {
-                    if ( get_service('user')->authenticated->is_admin ) {
+                    if ( $self->user->authenticated->is_admin ) {
                         $args->{ $f } //= $self->{ $f };
                     } else {
                         $args->{ $f } = $self->{ $f };
                     }
                 } elsif ( $self->can( $f ) ) {
-                    if ( get_service('user')->authenticated->is_admin ) {
+                    if ( $self->user->authenticated->is_admin ) {
                         $args->{ $f } //= $self->$f;
                     } else {
                         $args->{ $f } = $self->$f;
                     }
                 }
-                logger->fatal( "Can't get `$f` from self" ) unless $args->{ $f };
+                logger->fatal( "Can't get `$f` from self", $self ) unless length $args->{ $f };
             } elsif ( $v->{required} ) {
-                logger->fatal( "`$f` required" ) if not exists $args->{$f};
+                logger->fatal( "`$f` required", $self ) unless length $args->{$f};
             } elsif ( $v->{type} eq 'now' ) {
-                if ( get_service('user')->authenticated->is_admin ) {
+                if ( $self->user->authenticated->is_admin ) {
                     $args->{ $f } //= now;
                 } else {
                     $args->{ $f } = now;
@@ -375,9 +610,13 @@ sub clean_query_args {
             }
         }
 
-        # Quote where keys
-        for ( keys %{ $args->{where} || {} } ) {
-            $args->{where}{ "`$_`" } = delete $args->{where}{ $_ } if /^[a-z]+$/;
+        # Convert empty strings to the declared default value
+        # e.g. default => undef  → NULL, default => 0 → 0, default => {} → {}
+        for my $f ( keys %structure ) {
+            next unless exists $structure{$f}{default};
+            if ( exists $args->{$f} && defined $args->{$f} && !ref($args->{$f}) && $args->{$f} eq '' ) {
+                $args->{$f} = $structure{$f}{default};
+            }
         }
     }
 }
@@ -389,7 +628,10 @@ sub set {
 
     clean_query_args( $self, \%args, { is_update => 1 } );
 
-    return $self->_set( %args );
+    my $ret = $self->_set( %args );
+
+    $self->stats('set', \%args) if $ret;
+    return $ret;
 }
 
 sub _set {
@@ -400,11 +642,14 @@ sub _set {
     my $table = delete $args{table};
 
     my $sql = SQL::Abstract->new;
+    quote_where_keys( $args{where} );
     my ( $where, @bind ) = $sql->where( delete $args{where} );
 
-    my $data = join(',', map( "`$_`=?", keys %args ) );
+    my @keys = sort keys %args;
+    my @values = @args{@keys};
+    my $data = join(',', map( "`$_`=?", @keys ) );
 
-    return $self->do("UPDATE $table SET $data $where", values %args, @bind );
+    return $self->do("UPDATE $table SET $data $where", @values, @bind );
 }
 
 sub _delete {
@@ -420,6 +665,7 @@ sub _delete {
     clean_query_args( $self, \%args, { is_update => 1 } ) if $args{check_args};
 
     my $sql = SQL::Abstract->new;
+    quote_where_keys( $args{where} );
     my ( $where, @bind ) = $sql->where( $args{where} );
 
     return $self->do("DELETE FROM $table $where", @bind );
@@ -443,7 +689,10 @@ sub add {
 
     clean_query_args( $self, \%args );
 
-    return $self->_add( %args );
+    my $key_id = $self->_add( %args );
+
+    $self->stats('add', \%args) if $key_id;
+    return $key_id;
 }
 
 sub _add {
@@ -453,22 +702,35 @@ sub _add {
     $args{table}||= $self->table;
     my $table = delete $args{table};
 
-    my $fields = join(',', map( "`$_`", keys %args ) );
-    my $values = join(',', map('?',1..scalar( keys %args ) ));
+    my @keys = sort keys %args;
+    my @values = @args{@keys};
+    my $fields = join(',', map( "`$_`", @keys ) );
+    my $placeholders = join(',', map('?', @keys) );
 
-    my $sth = $self->do("INSERT INTO $table ($fields) VALUES($values)", values %args );
+    my $sth = $self->do("INSERT INTO $table ($fields) VALUES($placeholders)", @values );
     return undef unless $sth;
 
-    if ( $args{ $self->get_table_key } ) {
-        return $args{ $self->get_table_key };
+    my $table_key = $self->get_table_key;
+    if ( $table_key && exists $args{ $table_key } ) {
+        return $args{ $table_key };
     }
     return $self->insert_id;
+}
+
+sub quote_where_keys {
+    my $where = shift;
+
+    for ( sort keys %{ $where || {} } ) {
+        $where->{ "`$_`" } = delete $where->{ $_ } if /^[a-z]+$/;
+    }
 }
 
 sub _list {
     my $self = shift;
     my %args = @_;
     my @vars;
+
+    quote_where_keys( $args{where} );
 
     my $query = $self->query_select( vars => \@vars, %args );
 
@@ -505,7 +767,44 @@ sub list_for_api {
         @_,
     );
 
+    delete $args{user_id} unless $args{admin};
+
+    # Validate limit: must be a positive integer, capped at 1000 for non-admins.
+    # Admins may pass limit=0 to request all rows (no LIMIT clause).
+    $args{limit} = int( $args{limit} // 25 );
+    $args{limit} = 25   if $args{limit} !~ /^\d+$/ || $args{limit} < 0;
+    $args{limit} = 25   if $args{limit} == 0 && !$args{admin};
+    $args{limit} = 1000 if !$args{admin} && $args{limit} > 1000;
+
+    if ( $args{admin} && $args{user_id} ) {
+        $args{where} = {
+            user_id => delete $args{user_id},
+        }
+    }
+
+    my $table_key = $self->get_table_key;
+    if ( $args{ $table_key } ) {
+        $args{where}->{ $table_key } = $args{ $table_key };
+    }
+
     my $method = $args{admin} ? '_list' : 'list';
+
+    # Validate fields against structure to prevent SELECT injection.
+    # Complex expressions (containing SQL syntax like parentheses, wildcards or dots)
+    # are treated as trusted internal code and passed through unchanged.
+    my $fields;
+    if ( $args{fields} && $args{fields} ne '*' && $self->can('structure') ) {
+        if ( $args{fields} =~ /[().*]/ ) {
+            # Internal trusted SQL expression — pass through unchanged
+            $fields = $args{fields};
+        } else {
+            my %structure = %{ $self->structure };
+            my @safe = grep { exists $structure{$_} } split /\s*,\s*/, $args{fields};
+            $fields = @safe ? join(', ', map { "`$_`" } @safe) : undef;
+        }
+    } elsif ( $args{fields} ) {
+        $fields = $args{fields};
+    }
 
     my $where = {
         %{ $self->query_for_filtering( %{ $args{filter} || {} } ) || {} },
@@ -514,13 +813,17 @@ sub list_for_api {
 
     my $order = $self->query_for_order( %args );
 
+    # Validate range field against structure to prevent WHERE injection
     my $range;
     if ( $args{field} && $args{start} && $args{stop} ) {
-        $range = { field => $args{field}, start => $args{start}, stop => $args{stop} };
+        if ( !$self->can('structure') || exists $self->structure->{ $args{field} } ) {
+            $range = { field => $args{field}, start => $args{start}, stop => $args{stop} };
+        }
     }
 
     my @ret = $self->$method(
-        $range ? ( $range ) : (),
+        $fields ? ( fields => $fields ) : (),
+        $range ? ( range => $range ) : (),
         limit => $args{limit},
         offset => $args{offset},
         calc => 1,
@@ -529,31 +832,71 @@ sub list_for_api {
         join => $args{join},
     );
 
-    # Remove protected fields
-    unless ( $args{admin} ) {
-        my $structure = $self->structure;
+    return @ret;
+}
 
-        for my $item ( @ret ) {
-            for ( keys %{ $item } ) {
-                delete $item->{ $_ } if exists $structure->{ $_ }->{ hide_for_user } &&
-                    $structure->{ $_ }->{ hide_for_user };
+sub remove_protected_fields {
+    my $self = shift;
+    my $data = shift;
+    my %args = (
+        admin => 0,
+        @_,
+    );
+
+    return $data if $args{admin};
+
+    return undef unless $self->can('structure');
+    my $structure = $self->structure;
+
+    if ( ref $data eq 'ARRAY' ) {
+        for my $item ( @$data ) {
+            last if ref $item ne 'HASH';
+            for ( keys %$item ) {
+                delete $item->{ $_ } if $structure->{ $_ }->{ hide_for_user };
             }
+        }
+    } elsif ( ref $data eq 'HASH' ) {
+        for ( keys %$data ) {
+            delete $data->{ $_ } if $structure->{ $_ }->{ hide_for_user };
         }
     }
 
-    return @ret;
+    return $data;
 }
 
 sub get {
     my $self = shift;
 
     unless ( length $self->id ) {
-        logger->warning( sprintf("Can't get data for %s without id: `%s`", ref $self, $self->get_table_key ));
+        logger->debug( sprintf("Can't get data for %s without id: `%s`", ref $self, $self->get_table_key ));
         return undef;
     }
 
+    my $table_key = $self->get_table_key;
+
+    # Добавлять user_id автоматически если флаг: key_mul
+    my $user_id;
+    my $structure = $self->structure;
+    if ( $table_key ne 'user_id' && $structure->{user_id} && $structure->{user_id}->{key_mul} ) {
+        $user_id = $self->user_id;
+    }
+
+    my %where = (
+        sprintf("%s.%s", $self->table, $table_key ) => $self->id,
+        $user_id ? ( sprintf("%s.%s", $self->table, 'user_id' ) => $user_id, ) : (),
+    );
+
+    my $key2 = $self->get_table_key2;
+    if ( $key2 ) {
+        $where{ $key2 } = $self->{res}->{ $key2 };
+    }
+
     # do not use list() because of list might contain default selectors
-    my ( $ret ) = $self->_list( where => { sprintf("%s.%s", $self->table, $self->get_table_key ) => $self->id }, limit => 1, @_ );
+    my ( $ret ) = $self->_list(
+        where => \%where,
+        limit => 1,
+        @_,
+    );
     return wantarray ? %{ $ret||={} } : $ret;
 }
 
@@ -568,9 +911,33 @@ sub get_table_key {
     return undef;
 }
 
+sub get_table_key2 {
+    my $self = shift;
+
+    my $structure = $self->structure;
+
+    for ( keys %$structure ) {
+        return $_ if $structure->{ $_ }->{key2};
+    }
+    return undef;
+}
+
 sub res_by_arr {
     my $self = shift;
     return $self->{res} ? [ keys %{ $self->{res} } ] : [];
+}
+
+sub is_safe_identifier {
+    my $str  = shift;
+    my %opts = (
+        allow_dots => 0,
+        @_,
+    );
+
+    my $re = $opts{allow_dots}
+        ? qr/^[A-Za-z_][A-Za-z0-9_.]*$/
+        : qr/^[A-Za-z_][A-Za-z0-9_]*$/;
+    return $str =~ $re;
 }
 
 sub quote {
@@ -593,6 +960,7 @@ sub query_select {
         limit => undef,
         offset => undef,
         join => undef,
+        group_by => undef,
         order => undef,
         extra => undef,
         @_,
@@ -603,9 +971,11 @@ sub query_select {
         $args{table} = $self->can( 'table' ) ? $self->table : die 'Table required';
     }
 
+    my $structure = ($self && $self->can('structure')) ? $self->structure : {};
+
     if ( $args{where} && ref $args{where} ) {
         if ( ref $args{where} ne 'HASH' ) {
-            logger->fatal('WHERE not HASH!');
+            logger->fatal('WHERE not HASH!', $self);
         }
     }
     $args{where}||= {};
@@ -631,8 +1001,12 @@ sub query_select {
     }
 
     for my $k ( keys %{ $args{where} } ) {
-        if ( $k=~/(\w+)->(\w+)/ ) {
-            $args{where}{ sprintf("%s->>'\$.%s'", $1, $2) } = delete $args{where}{$k};
+        if ( $k=~/\./ ) {
+            my $q = dots_str_to_sql( $k );
+            next unless $q;
+            next unless exists $structure->{ $q->{field} };
+            next unless $structure->{ $q->{field} }->{type} eq 'json';
+            $args{where}{ $q->{query} } = delete $args{where}{$k};
         }
     }
 
@@ -675,9 +1049,18 @@ sub query_select {
             push @{ $args{vars} }, @bind;
     }
 
+    if ( $args{group_by} ) {
+        my @cols = ref $args{group_by} ? @{ $args{group_by} } : ( $args{group_by} );
+        $query .= ' GROUP BY ' . join( ', ', map { "`$_`" } @cols );
+    }
+
     if ( $args{order} ) {
         $query .= ' ORDER BY ';
-        $query .= join(',', map( "`".$args{order}->[$_*2]."` ".$args{order}->[$_*2+1], 0..scalar(@{ $args{order} })/2-1) );
+        $query .= join(',', map {
+            my $dir = uc( $args{order}->[$_*2+1] // '' );
+            $dir = 'ASC' unless $dir eq 'ASC' || $dir eq 'DESC';
+            "`".$args{order}->[$_*2]."` $dir"
+        } 0..scalar(@{ $args{order} })/2-1);
     }
 
     if ( $args{limit} ) {
