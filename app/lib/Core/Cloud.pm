@@ -3,6 +3,7 @@ package Core::Cloud;
 use v5.14;
 use parent 'Core::Base';
 use Core::Base;
+use URI;
 use Core::Utils qw(
     encode_json
     decode_json
@@ -11,7 +12,7 @@ use Core::Utils qw(
 );
 
 use constant {
-    CLOUD_URL => 'https://cloud.myshm.ru',
+    CLOUD_URL => $ENV{SHM_CLOUD_URL} || 'https://cloud.myshm.ru',
 };
 
 sub http {
@@ -128,9 +129,11 @@ sub login_user {
         @_,
     );
 
+    # Своему облаку (SHM_CLOUD_URL) пароль передаем в теле запроса, чтобы он не попадал в логи.
+    # cloud.myshm.ru принимает только GET
     my $response = $self->http(
         url => CLOUD_URL . '/auth',
-        method => 'get',
+        method => $ENV{SHM_CLOUD_URL} ? 'post' : 'get',
         headers => {
             ps => join(',', $self->ps_list),
         },
@@ -141,7 +144,8 @@ sub login_user {
     );
 
     unless ( $response->is_success ) {
-        my $error = $response->json_content->{error};
+        my $json = $response->json_content;
+        my $error = $json ? $json->{error} : $response->status_line;
         my $status_code = $response->code;
         $status_code = 400 if $status_code == 401; # do not use 401 code because it reserves by Web
         report->status( $status_code );
@@ -256,6 +260,25 @@ sub paysystems {
     );
 
     return $response && $response->is_success ? $response->json_content->{data} : undef;
+}
+
+sub delete_autopayment {
+    my $self = shift;
+    my %args = (
+        pay_system => undef,
+        @_,
+    );
+
+    # Для DELETE параметры передаем в строке запроса
+    my $uri = URI->new('/user/autopayment');
+    $uri->query_form( pay_system => $args{pay_system} );
+
+    my $response = $self->cloud_request(
+        url => $uri->as_string,
+        method => 'delete',
+    );
+
+    return $response && $response->is_success ? $response->json_content : undef;
 }
 
 sub ps_list {

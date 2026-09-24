@@ -9,7 +9,7 @@ on:
   schedule:
     - cron: '36 23 * * *'
   push:
-    branches: [ "master" ]
+    branches: [ "master", "cloud" ]
     # Publish semver tags as releases.
     tags: [ 'v*.*.*' ]
   pull_request:
@@ -18,14 +18,17 @@ on:
 env:
   # Use docker.io for Docker Hub if empty
   REGISTRY: ghcr.io
-  # github.repository as <account>/<repo>
-  IMAGE_NAME: ${{ github.repository }}
 
 
 jobs:
   build:
 
     runs-on: ubuntu-latest
+    # Образы ${REGISTRY}/<owner>/shm-core и shm-api, как их ждет docker-compose.yml:
+    # SHM_REPO=ghcr.io/<owner> CORE_VERSION=<ветка или тег>
+    strategy:
+      matrix:
+        target: [ core, api ]
     permissions:
       contents: read
       packages: write
@@ -36,6 +39,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # Имя образа в GHCR должно быть в нижнем регистре
+      - name: Set image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY_OWNER,,}/shm-${{ matrix.target }}" >> "$GITHUB_ENV"
 
       # Install the cosign tool except on PR
       # https://github.com/sigstore/cosign-installer
@@ -76,11 +83,12 @@ jobs:
         uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
         with:
           context: .
+          target: ${{ matrix.target }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
 
       # Sign the resulting Docker image digest except on PRs.
       # This will only write to the public Rekor transparency log when the Docker

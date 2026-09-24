@@ -1,0 +1,38 @@
+{
+    "title": "Crypto Pay",
+    "description": "Прием оплаты криптовалютой через @CryptoBot в Telegram",
+    "version": "1.0.0",
+    "infoMessage": "<p>Создайте приложение в <a href=\"https://t.me/CryptoBot\" target=\"_blank\">@CryptoBot</a> (Crypto Pay → Create App), включите вебхуки и укажите адрес <b>https://ВАШ_ДОМЕН/shm/pay_systems/cryptopay.cgi</b>.</p><p>Сумма зачисляется в валюте счета, поэтому она должна совпадать с валютой биллинга.</p>",
+    "fields": [
+        { "name": "name", "label": "Название для клиентов", "type": "text", "required": true, "default": "Криптовалюта" },
+        { "name": "show_for_client", "label": "Показывать клиентам", "type": "checkbox", "default": true },
+        { "name": "weight", "label": "Порядок в списке (больше - выше)", "type": "number", "default": 0 },
+        { "name": "api_key", "label": "API токен приложения", "type": "password", "required": true },
+        {
+            "name": "fiat",
+            "label": "Валюта счета",
+            "type": "select",
+            "default": "RUB",
+            "options": [
+                { "value": "RUB", "label": "RUB" },
+                { "value": "USD", "label": "USD" },
+                { "value": "EUR", "label": "EUR" },
+                { "value": "KZT", "label": "KZT" },
+                { "value": "UAH", "label": "UAH" }
+            ]
+        },
+        { "name": "description", "label": "Описание счета", "type": "text", "default": "Пополнение баланса" },
+        {
+            "name": "paid_btn_name",
+            "label": "Кнопка после оплаты",
+            "type": "select",
+            "options": [
+                { "value": "openBot", "label": "Открыть бота" },
+                { "value": "openChannel", "label": "Открыть канал" },
+                { "value": "viewItem", "label": "Посмотреть товар" },
+                { "value": "callback", "label": "Вернуться" }
+            ]
+        },
+        { "name": "paid_btn_url", "label": "Ссылка для кнопки", "type": "url", "placeholder": "https://t.me/your_bot" }
+    ]
+}

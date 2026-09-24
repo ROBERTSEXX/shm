@@ -7,6 +7,10 @@ SHM: Universal Billing with external actions
 
 https://docs.myshm.ru
 
+## Свое облако SHM
+
+Серверная часть облака (замена `cloud.myshm.ru`) и подключение к ней: [CLOUD.md](CLOUD.md).
+
 ## Система тегирования и релизов
 
 ### Правила создания тегов

@@ -22,6 +22,8 @@ services:
       DB_PASS: ${MYSQL_PASS}
       DB_HOST: ${MYSQL_HOST}
       DB_PORT: ${MYSQL_PORT}
+      SHM_CLOUD_URL: ${SHM_CLOUD_URL:-}
+      SHM_CLOUD_SERVER: ${SHM_CLOUD_SERVER:-}
     volumes:
       - "shm-data:/app/data"
     depends_on:
@@ -44,6 +46,8 @@ services:
       DB_PASS: ${MYSQL_PASS}
       DB_HOST: ${MYSQL_HOST}
       DB_PORT: ${MYSQL_PORT}
+      SHM_CLOUD_URL: ${SHM_CLOUD_URL:-}
+      SHM_CLOUD_SERVER: ${SHM_CLOUD_SERVER:-}
     volumes:
       - "shm-data:/app/data"
     depends_on:

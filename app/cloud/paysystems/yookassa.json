@@ -1,0 +1,34 @@
+{
+    "title": "ЮKassa",
+    "description": "Прием оплаты картами, СБП, SberPay и кошельками через ЮKassa, с поддержкой автоплатежей",
+    "version": "1.0.0",
+    "infoMessage": "<p>В <a href=\"https://yookassa.ru/my/merchant/integration/http-notifications\" target=\"_blank\">настройках HTTP-уведомлений</a> укажите адрес <b>https://ВАШ_ДОМЕН/shm/pay_systems/yookassa.cgi</b> и включите события payment.succeeded, payment.canceled и refund.succeeded.</p><p>Каждое уведомление перепроверяется запросом в API ЮKassa. Для копии платежной системы добавьте к адресу <b>?ps=ключ_копии</b>.</p>",
+    "fields": [
+        { "name": "name", "label": "Название для клиентов", "type": "text", "required": true, "default": "Банковская карта" },
+        { "name": "show_for_client", "label": "Показывать клиентам", "type": "checkbox", "default": true },
+        { "name": "weight", "label": "Порядок в списке (больше - выше)", "type": "number", "default": 0 },
+        { "name": "account_id", "label": "shopId", "type": "text", "required": true },
+        { "name": "api_key", "label": "Секретный ключ", "type": "password", "required": true },
+        { "name": "description", "label": "Назначение платежа", "type": "text", "default": "Пополнение баланса" },
+        { "name": "return_url", "label": "Адрес возврата после оплаты", "type": "url", "placeholder": "https://example.com" },
+        { "name": "save_payments", "label": "Сохранять способ оплаты для автоплатежей", "type": "checkbox", "default": false },
+        { "name": "allow_recurring", "label": "Разрешить автоплатежи", "type": "checkbox", "default": false, "visibleIf": { "field": "save_payments", "value": true } },
+        { "name": "send_receipt", "label": "Отправлять чеки (54-ФЗ)", "type": "checkbox", "default": false },
+        { "name": "customer_email", "label": "Email для чеков по умолчанию", "type": "email", "visibleIf": { "field": "send_receipt", "value": true } },
+        {
+            "name": "vat_code",
+            "label": "Ставка НДС",
+            "type": "select",
+            "default": "1",
+            "visibleIf": { "field": "send_receipt", "value": true },
+            "options": [
+                { "value": "1", "label": "Без НДС" },
+                { "value": "2", "label": "НДС 0%" },
+                { "value": "3", "label": "НДС 10%" },
+                { "value": "4", "label": "НДС 20%" },
+                { "value": "5", "label": "НДС 10/110" },
+                { "value": "6", "label": "НДС 20/120" }
+            ]
+        }
+    ]
+}

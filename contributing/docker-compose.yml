@@ -29,6 +29,9 @@ services:
       DB_PASS: shm-db-user-pass
       DB_HOST: mysql
       DB_PORT: 3306
+      # Установка сама себе облако: для тестов t/api/cloud_*.t
+      SHM_CLOUD_SERVER: 1
+      SHM_CLOUD_URL: http://api/shm/v1/cloud
     links:
       - mysql
     volumes:
@@ -66,6 +69,7 @@ services:
       DB_PASS: shm-db-user-pass
       DB_HOST: mysql
       DB_PORT: 3306
+      SHM_CLOUD_URL: http://api/shm/v1/cloud
     links:
       - mysql
     volumes:

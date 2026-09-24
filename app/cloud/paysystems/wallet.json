@@ -1,0 +1,37 @@
+{
+    "title": "Wallet Pay",
+    "description": "Прием оплаты криптовалютой через кошелек в Telegram (@wallet)",
+    "version": "1.0.0",
+    "infoMessage": "<p>В <a href=\"https://pay.wallet.tg\" target=\"_blank\">кабинете магазина Wallet Pay</a> укажите адрес вебхуков <b>https://ВАШ_ДОМЕН/shm/pay_systems/wallet.cgi</b>.</p><p>Сумма зачисляется в валюте заказа, поэтому она должна совпадать с валютой биллинга.</p>",
+    "fields": [
+        { "name": "name", "label": "Название для клиентов", "type": "text", "required": true, "default": "Wallet Pay" },
+        { "name": "show_for_client", "label": "Показывать клиентам", "type": "checkbox", "default": true },
+        { "name": "weight", "label": "Порядок в списке (больше - выше)", "type": "number", "default": 0 },
+        { "name": "api_key", "label": "API ключ магазина", "type": "password", "required": true },
+        {
+            "name": "currency_code",
+            "label": "Валюта заказа",
+            "type": "select",
+            "default": "RUB",
+            "options": [
+                { "value": "RUB", "label": "RUB" },
+                { "value": "USD", "label": "USD" },
+                { "value": "EUR", "label": "EUR" }
+            ]
+        },
+        {
+            "name": "auto_conversion_currency",
+            "label": "Автоконвертация в",
+            "type": "select",
+            "options": [
+                { "value": "TON", "label": "TON" },
+                { "value": "USDT", "label": "USDT" },
+                { "value": "BTC", "label": "BTC" },
+                { "value": "NOT", "label": "NOT" }
+            ]
+        },
+        { "name": "description", "label": "Описание заказа", "type": "text", "default": "Пополнение баланса" },
+        { "name": "return_url", "label": "Адрес после оплаты", "type": "url", "placeholder": "https://t.me/your_bot" },
+        { "name": "fail_return_url", "label": "Адрес при ошибке оплаты", "type": "url", "placeholder": "https://t.me/your_bot" }
+    ]
+}

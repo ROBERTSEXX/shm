@@ -1,0 +1,24 @@
+{
+    "title": "ЮMoney",
+    "description": "Прием оплаты банковской картой и из кошелька ЮMoney на ваш кошелек",
+    "version": "1.0.0",
+    "infoMessage": "<p>В <a href=\"https://yoomoney.ru/transfer/myservices/http-notification\" target=\"_blank\">настройках HTTP-уведомлений</a> кошелька укажите адрес <b>https://ВАШ_ДОМЕН/shm/pay_systems/yoomoney.cgi</b> и скопируйте оттуда секрет.</p><p>Для копии платежной системы добавьте к адресу <b>?ps=ключ_копии</b>.</p>",
+    "fields": [
+        { "name": "name", "label": "Название для клиентов", "type": "text", "required": true, "default": "ЮMoney" },
+        { "name": "show_for_client", "label": "Показывать клиентам", "type": "checkbox", "default": true },
+        { "name": "weight", "label": "Порядок в списке (больше - выше)", "type": "number", "default": 0 },
+        { "name": "account", "label": "Номер кошелька", "type": "text", "required": true, "placeholder": "4100000000000000" },
+        { "name": "secret", "label": "Секрет для проверки уведомлений", "type": "password", "required": true },
+        {
+            "name": "payment_type",
+            "label": "Способ оплаты",
+            "type": "select",
+            "default": "AC",
+            "options": [
+                { "value": "AC", "label": "Банковская карта" },
+                { "value": "PC", "label": "Кошелек ЮMoney" }
+            ]
+        },
+        { "name": "success_url", "label": "Адрес возврата после оплаты", "type": "url", "placeholder": "https://example.com" }
+    ]
+}

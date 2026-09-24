@@ -2270,6 +2270,15 @@ state $routes //= {
         method => 'paysystems',
     },
 },
+'/admin/cloud/autopayment' => {
+    DELETE => {
+        params => {
+            pay_system => { type => 'string', required => 1, max_length => 64 },
+        },
+        controller => 'Cloud',
+        method => 'delete_autopayment',
+    },
+},
 '/admin/cloud/currencies' => {
     GET => {
         params => {
@@ -2377,6 +2386,173 @@ $routes->{'/admin/system/locations'} //= {
         swagger => { summary => 'Список доступных локейшенов и методов (админ)' },
     },
 };
+
+# Серверная часть SHM Cloud (Core::CloudServer).
+# Клиенты SHM подключаются к ней через SHM_CLOUD_URL=https://<host>/shm/v1/cloud
+if ( $ENV{SHM_CLOUD_SERVER} ) {
+    my %cloud_json = ( args => { format => 'json' } );
+
+    $routes->{'/cloud/test'} //= $routes->{'/test'};
+    $routes->{'/cloud/user/captcha'} //= $routes->{'/user/captcha'};
+    $routes->{'/cloud/user/pay/paysystems'} //= $routes->{'/user/pay/paysystems'};
+    $routes->{'/cloud/user/autopayment'} //= $routes->{'/user/autopayment'};
+
+    # GET - как у cloud.myshm.ru (пароль в строке запроса), POST - пароль в теле запроса
+    my %cloud_auth = (
+        params => {
+            login    => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+            password => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+        },
+        controller => 'CloudServer',
+        method => 'auth',
+        skip_check_auth => 1,
+        swagger => { summary => 'Вход клиента SHM в облако' },
+    );
+
+    $routes->{'/cloud/auth'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        GET  => { %cloud_auth },
+        POST => { %cloud_auth },
+    };
+
+    $routes->{'/cloud/auth/reset'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        POST => {
+            params => {
+                login    => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+                password => { type => 'string', required => 1, min_length => 1, max_length => 128 },
+            },
+            controller => 'CloudServer',
+            method => 'auth_reset',
+            skip_check_auth => 1,
+            swagger => { summary => 'Сброс привязки аккаунта к IP адресу' },
+        },
+    };
+
+    $routes->{'/cloud/user'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        GET => $routes->{'/user'}->{GET},
+        PUT => {
+            params => {
+                login          => { type => 'string', required => 1, min_length => 1, max_length => 64 },
+                password       => { type => 'string', required => 1, min_length => 10, max_length => 128 },
+                captcha_token  => { type => 'string', required => 1 },
+                captcha_answer => { type => 'string', required => 1 },
+            },
+            controller => 'CloudServer',
+            method => 'reg',
+            skip_check_auth => 1,
+            swagger => { summary => 'Регистрация аккаунта облака' },
+        },
+    };
+
+    $routes->{'/cloud/service/sub/get'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        GET => {
+            params => {},
+            controller => 'CloudServer',
+            method => 'sub_get',
+            %cloud_json,
+            swagger => { summary => 'Текущая подписка' },
+        },
+    };
+
+    $routes->{'/cloud/service/sub/list'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        GET => {
+            params => {},
+            controller => 'CloudServer',
+            method => 'sub_list',
+            %cloud_json,
+            swagger => { summary => 'Тарифы подписки' },
+        },
+    };
+
+    $routes->{'/cloud/service/sub/reg'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        POST => {
+            params => {
+                service_id => { type => 'integer', required => 1, min => 1 },
+            },
+            controller => 'CloudServer',
+            method => 'sub_reg',
+            %cloud_json,
+            swagger => { summary => 'Оформление подписки' },
+        },
+    };
+
+    $routes->{'/cloud/service/sub/renewal'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        POST => {
+            params => {
+                service_id => { type => 'integer', required => 1, min => -1 },
+            },
+            controller => 'CloudServer',
+            method => 'sub_renewal',
+            %cloud_json,
+            swagger => { summary => 'Тариф продления подписки (-1 - не продлевать)' },
+        },
+    };
+
+    $routes->{'/cloud/service/paysystems/list'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        GET => {
+            params => {},
+            controller => 'CloudServer',
+            method => 'ps_list',
+            %cloud_json,
+            swagger => { summary => 'Каталог платежных систем' },
+        },
+    };
+
+    $routes->{'/cloud/service/paysystems/order'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        GET => {
+            params => {
+                ps => { type => 'string', required => 1, max_length => 64 },
+            },
+            controller => 'CloudServer',
+            method => 'ps_order',
+            %cloud_json,
+            swagger => { summary => 'Покупка платежной системы' },
+        },
+    };
+
+    $routes->{'/cloud/service/paysystems/download'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        GET => {
+            params => {
+                ps      => { type => 'string', required => 1, max_length => 64 },
+                arch    => { type => 'string', max_length => 32 },
+                version => { type => 'string', max_length => 32 },
+            },
+            controller => 'CloudServer',
+            method => 'ps_download',
+            args => { format => 'plain' },
+            swagger => { summary => 'Скачивание модуля платежной системы' },
+        },
+    };
+
+    $routes->{'/cloud/service/currencies/list'} //= {
+        swagger => { tags => 'SHM Cloud (сервер)' },
+        GET => {
+            params => {},
+            controller => 'CloudServer',
+            method => 'currencies',
+            %cloud_json,
+            swagger => { summary => 'Курсы валют с надбавками пользователя' },
+        },
+        POST => {
+            params => {
+                currencies => { type => 'object', required => 1 },
+            },
+            controller => 'CloudServer',
+            method => 'currencies_save',
+            %cloud_json,
+            swagger => { summary => 'Сохранение надбавок к курсам валют' },
+        },
+    };
+}
 
 state $router //= Router::Simple->new();
 for my $uri ( keys %{ $routes } ) {
