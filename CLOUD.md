@@ -52,7 +52,9 @@ SHM_REPO="ghcr.io/robertsexx"
 CORE_VERSION=cloud
 ```
 
-Если пакеты в GHCR приватные, на сервере нужен `docker login ghcr.io`, либо сделайте пакеты публичными в настройках GitHub.
+Если GitHub отключил workflow за неактивность, включите его: Actions → Docker → Enable workflow,
+затем Run workflow на ветке `cloud`. Если пакеты в GHCR приватные, на сервере нужен `docker login ghcr.io`,
+либо сделайте пакеты публичными в настройках GitHub.
 Админка и клиентский кабинет (`danuk/shm-admin`, `danuk/shm-client-2`) остаются официальными.
 
 ## Запуск облака
